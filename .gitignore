@@ -17,3 +17,23 @@ opencode.jsonc
 skills-lock.json
 .DS_Store
 worker-configuration.d.ts
+
+# Local operator artifacts and private runtime state
+.hermes/
+/private/
+/data/
+/mail-state/
+/spool/
+/backups/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.pem
+*.key
+
+# Verification/build outputs
+playwright-report/
+test-results/
+coverage/

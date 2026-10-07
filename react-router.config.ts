@@ -4,8 +4,11 @@
 
 import type { Config } from "@react-router/dev/config";
 
+// Harizco Post: single-page application build. The Node runtime
+// (server/index.ts) serves dist/client and the API on loopback.
 export default {
-  ssr: true,
+  ssr: false,
+  buildDirectory: "dist",
   future: {
     v8_viteEnvironmentApi: true,
   },
