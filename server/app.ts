@@ -17,6 +17,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import type { AppConfig } from "./config";
 import type { MailBackend, ConfiguredAddresses, FlagInput } from "./mail/backend";
+import type { StatusReport } from "./routes/status";
 
 /** Authentication strategies supported by the composition root. */
 export type AuthMode =
@@ -48,6 +49,8 @@ export interface CreateAppOptions {
 	backend?: MailBackend;
 	/** Operator-provisioned address map returned by GET /api/v1/config. */
 	addresses?: ConfiguredAddresses;
+	/** Sync/import status source for GET /api/v1/status (content-free). */
+	statusProvider?: () => StatusReport | Promise<StatusReport>;
 }
 
 const NO_STORE = "no-store";
@@ -91,6 +94,7 @@ function denyPrivateAccess(): Response {
  */
 function isPrivateApiPath(path: string): boolean {
 	if (path === "/api/v1/config" || path === "/api/v1/mailboxes") return true;
+	if (path === "/api/v1/status") return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/emails$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+$/.test(path)) return true;
@@ -144,6 +148,26 @@ export function createApp(options: CreateAppOptions): Hono {
 		// authMode === "fixture": explicit test-only seam.
 		const method = c.req.method;
 		mailStore?.record?.(method, path);
+
+		// Status is content-free and does not require a mail backend, so it is
+		// served even when no mailbox backend is wired.
+		if (method === "GET" && path === "/api/v1/status") {
+			if (!options.statusProvider) {
+				return jsonOk({
+					lastSuccessAt: null,
+					pending: 0,
+					failed: 0,
+					quarantined: 0,
+					verified: 0,
+					oldestPendingAt: null,
+				});
+			}
+			try {
+				return jsonOk(await options.statusProvider());
+			} catch {
+				return jsonError(503, "Sync status is unavailable");
+			}
+		}
 
 		// No real backend is wired yet: keep the honest 503 (Phase 1 contract),
 		// even when a probe is present. A probe is not a mailbox.

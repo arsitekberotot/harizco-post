@@ -15,6 +15,7 @@ import type { Hono } from "hono";
 import type { MailStore } from "../../server/app";
 import type { MailBackend, ConfiguredAddresses } from "../../server/mail/backend";
 import type { AppConfig } from "../../server/config";
+import type { StatusReport } from "../../server/routes/status";
 
 // Collect the individual contracts even before the planned modules exist.
 // Missing runtime code is a test assertion failure, not an empty failed suite.
@@ -62,6 +63,8 @@ export type CreateTestAppOptions = {
 	backend?: MailBackend;
 	/** Operator-provisioned addresses returned by GET /api/v1/config. */
 	addresses?: ConfiguredAddresses;
+	/** Sync/import status source for GET /api/v1/status. */
+	statusProvider?: () => StatusReport | Promise<StatusReport>;
 };
 
 export type TestAppHandle = {
@@ -124,6 +127,7 @@ export function createTestApp(
 		mailStore,
 		...(options.backend ? { backend: options.backend } : {}),
 		...(options.addresses ? { addresses: options.addresses } : {}),
+		...(options.statusProvider ? { statusProvider: options.statusProvider } : {}),
 	});
 
 	return { app, config, mailStore };

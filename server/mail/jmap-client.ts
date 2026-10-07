@@ -64,13 +64,23 @@ export class JmapClient {
 	}
 
 	#headers(): Record<string, string> {
+		return {
+			...this.authHeaders(),
+			"Content-Type": "application/json",
+		};
+	}
+
+	/**
+	 * Authentication headers only (no Content-Type), for non-JSON requests such
+	 * as blob uploads. The adapter owns the secret; callers never see it.
+	 */
+	authHeaders(): Record<string, string> {
 		// Stalwart accepts HTTP basic auth for JMAP; the adapter owns the secret.
 		const token = Buffer.from(`${this.#auth.username}:${this.#auth.secret}`).toString("base64");
 		this.lastAuthHeaders = `Bearer ${this.#auth.secret}`;
 		return {
 			Authorization: `Bearer ${this.#auth.secret}`,
 			"X-Harizco-Basic": `Basic ${token}`,
-			"Content-Type": "application/json",
 		};
 	}
 

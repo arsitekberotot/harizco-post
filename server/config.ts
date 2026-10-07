@@ -130,3 +130,85 @@ export function loadConfig(env: Record<string, string | undefined> = {}): AppCon
 }
 
 export { LOOPBACK_HOST, DEFAULT_PORT, BYPASS_FLAGS };
+
+// ---------------------------------------------------------------------------
+// Sync worker configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration owned by the sync worker only.
+ *
+ * The web process never loads this: Resend and Stalwart credentials live with
+ * the worker that needs them, so a web compromise cannot read mail secrets.
+ */
+export interface SyncConfig {
+	/** SQLite integration journal path. */
+	dbPath: string;
+	/** Directory the raw-MIME spool owns. */
+	spoolDir: string;
+	/** Resend receiving API key. */
+	resendApiKey: string;
+	/** Resend API base URL (defaulted). */
+	resendBaseUrl: string;
+	/** Provider label recorded in the journal. */
+	provider: string;
+	/** Seconds between polls. */
+	intervalSeconds: number;
+	/** Stalwart JMAP endpoint. */
+	stalwartUrl: string;
+	/** Stalwart JMAP username. */
+	stalwartUsername: string;
+	/** Stalwart JMAP secret. */
+	stalwartSecret: string;
+	/** Account the worker imports into; discovered when absent. */
+	stalwartAccountId?: string;
+}
+
+const DEFAULT_INTERVAL_SECONDS = 60;
+// The runner refuses intervals below 30s to respect provider rate limits, so
+// the config floor matches rather than accepting a value the runner rejects.
+const MIN_INTERVAL_SECONDS = 30;
+const MAX_INTERVAL_SECONDS = 3600;
+
+function required(env: Record<string, string | undefined>, name: string): string {
+	const value = (env[name] ?? "").trim();
+	if (value === "") {
+		throw new Error(`Sync worker requires ${name}.`);
+	}
+	return value;
+}
+
+function parseInterval(raw: string | undefined): number {
+	if (raw === undefined || raw.trim() === "") return DEFAULT_INTERVAL_SECONDS;
+	if (!/^\d+$/.test(raw.trim())) {
+		throw new Error(`Invalid SYNC_INTERVAL_SECONDS: expected an integer, received "${raw}"`);
+	}
+	const seconds = Number.parseInt(raw.trim(), 10);
+	if (seconds < MIN_INTERVAL_SECONDS || seconds > MAX_INTERVAL_SECONDS) {
+		throw new Error(
+			`Invalid SYNC_INTERVAL_SECONDS: ${seconds} is outside ${MIN_INTERVAL_SECONDS}-${MAX_INTERVAL_SECONDS}`,
+		);
+	}
+	return seconds;
+}
+
+/**
+ * Build the sync worker config.
+ *
+ * @throws when any required credential or endpoint is missing, so the worker
+ * refuses to start rather than silently poll nothing.
+ */
+export function loadSyncConfig(env: Record<string, string | undefined> = {}): SyncConfig {
+	return {
+		dbPath: (env.SYNC_DB_PATH ?? env.DB_PATH ?? "var/harizco-post.sqlite").trim(),
+		spoolDir: (env.SPOOL_DIR ?? "var/spool").trim(),
+		resendApiKey: required(env, "RESEND_API_KEY"),
+		resendBaseUrl: (env.RESEND_BASE_URL ?? "https://api.resend.com").trim(),
+		provider: (env.RECEIVING_PROVIDER ?? "resend").trim(),
+		intervalSeconds: parseInterval(env.SYNC_INTERVAL_SECONDS),
+		stalwartUrl: required(env, "STALWART_URL").replace(/\/$/, ""),
+		stalwartUsername: required(env, "STALWART_USERNAME"),
+		stalwartSecret: required(env, "STALWART_SECRET"),
+		...(env.STALWART_ACCOUNT_ID ? { stalwartAccountId: env.STALWART_ACCOUNT_ID.trim() } : {}),
+	};
+}

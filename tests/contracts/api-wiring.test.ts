@@ -212,4 +212,33 @@ describe("Phase 2: compatibility API forwards to the MailBackend", () => {
 		const res = await app.request("/api/v1/mailboxes");
 		expect(res.headers.get("cache-control") ?? "").toMatch(/no-store/i);
 	});
+
+	test("GET /api/v1/status is served without a mail backend", async () => {
+		const { app } = createTestApp({ authMode: "fixture" });
+		const res = await app.request("/api/v1/status");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { pending: number; verified: number };
+		expect(body.pending).toBe(0);
+		expect(body.verified).toBe(0);
+	});
+
+	test("GET /api/v1/status reports injected sync state", async () => {
+		const { app } = createTestApp({
+			authMode: "fixture",
+			statusProvider: () => ({
+				lastSuccessAt: "2026-10-07T05:00:00Z",
+				pending: 2,
+				failed: 1,
+				quarantined: 0,
+				verified: 40,
+				oldestPendingAt: "2026-10-07T04:59:00Z",
+			}),
+		});
+		const res = await app.request("/api/v1/status");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { pending: number; verified: number; lastSuccessAt: string };
+		expect(body.pending).toBe(2);
+		expect(body.verified).toBe(40);
+		expect(body.lastSuccessAt).toBe("2026-10-07T05:00:00Z");
+	});
 });
