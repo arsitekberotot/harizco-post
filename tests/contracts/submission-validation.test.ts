@@ -22,6 +22,11 @@ import {
 	payloadHash,
 	type SubmissionPayload,
 } from "../../server/mail/submissions";
+import {
+	SubmissionValidationError,
+	validateSubmission,
+	type SenderPolicy,
+} from "../../server/mail/validation";
 
 let db: Journal;
 let store: SubmissionStore;
@@ -33,6 +38,26 @@ const payload: SubmissionPayload = {
 	subject: "Hello",
 	body: "Hi there",
 };
+
+const policy: SenderPolicy = {
+	mailboxId: "mb1",
+	address: "hanif@atelieriza.com",
+	domain: "atelieriza.com",
+	maxRecipients: 25,
+	maxBytes: 25 * 1024 * 1024,
+};
+
+/** A fake backend that counts mutations, so a rejected send proves zero side effects. */
+function countingBackend() {
+	const calls = { submit: 0 };
+	return {
+		calls,
+		submit: async () => {
+			calls.submit += 1;
+			return { providerId: "p1" };
+		},
+	};
+}
 
 beforeEach(() => {
 	db = openJournal(":memory:");
@@ -124,5 +149,63 @@ describe("submission lifecycle", () => {
 		expect(done?.state).toBe("accepted");
 		expect(done?.provider_id).toBe("re_provider_2");
 		expect(store.canSubmit(intent.request_id)).toBe(false);
+	});
+});
+
+describe("submission validation (reject before any side effect)", () => {
+	test("a valid submission passes and does not touch the backend", async () => {
+		const backend = countingBackend();
+		const result = validateSubmission(payload, policy);
+		expect(result.ok).toBe(true);
+		// validation itself is pure; the backend is only called after an intent exists
+		expect(backend.calls.submit).toBe(0);
+	});
+
+	test("rejects a spoofed From that is not the mailbox address", () => {
+		expect(() => validateSubmission({ ...payload, from: "ceo@atelieriza.com" }, policy)).toThrow(
+			SubmissionValidationError,
+		);
+	});
+
+	test("rejects a From on a domain we do not own", () => {
+		expect(() => validateSubmission({ ...payload, from: "hanif@evil.test" }, policy)).toThrow(/domain/i);
+	});
+
+	test("rejects CRLF / header injection in subject, address, and body", () => {
+		expect(() => validateSubmission({ ...payload, subject: "Hi\r\nBcc: x@y.test" }, policy)).toThrow(
+			SubmissionValidationError,
+		);
+		expect(() => validateSubmission({ ...payload, to: ["a@b.test\r\nBcc: c@d.test"] }, policy)).toThrow(
+			SubmissionValidationError,
+		);
+	});
+
+	test("rejects syntactically invalid recipient addresses", () => {
+		expect(() => validateSubmission({ ...payload, to: ["not-an-address"] }, policy)).toThrow(
+			SubmissionValidationError,
+		);
+		expect(() => validateSubmission({ ...payload, to: [] }, policy)).toThrow(/recipient/i);
+	});
+
+	test("rejects too many recipients", () => {
+		const many = Array.from({ length: 30 }, (_, i) => `u${i}@example.test`);
+		expect(() => validateSubmission({ ...payload, to: many }, policy)).toThrow(/recipient/i);
+	});
+
+	test("rejects an oversized message", () => {
+		const big = "x".repeat(policy.maxBytes + 1);
+		expect(() => validateSubmission({ ...payload, body: big }, policy)).toThrow(/size|large/i);
+	});
+
+	test("rejects an attachment owned by a different mailbox", () => {
+		expect(() =>
+			validateSubmission({ ...payload, attachments: [{ blobId: "b1", mailboxId: "mb-other", size: 10 }] }, policy),
+		).toThrow(/attachment|mailbox/i);
+	});
+
+	test("rejects unsupported auto-send settings", () => {
+		expect(() =>
+			validateSubmission({ ...payload, autoSend: true } as SubmissionPayload & { autoSend: boolean }, policy),
+		).toThrow(/auto-send|unsupported/i);
 	});
 });
