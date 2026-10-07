@@ -5,9 +5,10 @@
 /**
  * Consolidated date formatting utilities.
  *
- * Previously spread across `app/lib/utils.ts` (4 functions) and
- * `workers/lib/html.ts` (`formatEmailDate`). Now one canonical set
- * imported by both the frontend and backend.
+ * Previously spread across `app/lib/utils.ts` (4 functions) and the upstream
+ * Workers html helper (`formatEmailDate`). The Workers runtime has since been
+ * removed; this is now the one canonical set imported by both the frontend and
+ * the local Node backend.
  */
 
 /** Parse safely — returns null on invalid dates instead of NaN-date. */
