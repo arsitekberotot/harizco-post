@@ -13,6 +13,7 @@
 
 import type { Hono } from "hono";
 import type { MailStore } from "../../server/app";
+import type { MailBackend, ConfiguredAddresses } from "../../server/mail/backend";
 import type { AppConfig } from "../../server/config";
 
 // Collect the individual contracts even before the planned modules exist.
@@ -57,6 +58,10 @@ export type CreateTestAppOptions = {
 	authMode?: TestAuthMode;
 	/** Process-like env map passed to `loadConfig`. */
 	env?: Record<string, string | undefined>;
+	/** Real mail backend (Phase 2+). Absent => honest 503 on private reads. */
+	backend?: MailBackend;
+	/** Operator-provisioned addresses returned by GET /api/v1/config. */
+	addresses?: ConfiguredAddresses;
 };
 
 export type TestAppHandle = {
@@ -117,6 +122,8 @@ export function createTestApp(
 		config,
 		authMode,
 		mailStore,
+		...(options.backend ? { backend: options.backend } : {}),
+		...(options.addresses ? { addresses: options.addresses } : {}),
 	});
 
 	return { app, config, mailStore };

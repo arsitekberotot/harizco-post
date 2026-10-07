@@ -39,8 +39,8 @@ export interface JmapClientOptions {
 	timeoutMs?: number;
 }
 
-type MethodCall = [name: string, args: Record<string, unknown>, tag: string];
-type MethodResponse = [name: string, args: Record<string, unknown>, tag: string];
+export type MethodCall = [name: string, args: Record<string, unknown>, tag: string];
+export type MethodResponse = [name: string, args: Record<string, unknown>, tag: string];
 
 export class JmapClient {
 	readonly #baseUrl: string;
