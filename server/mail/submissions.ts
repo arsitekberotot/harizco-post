@@ -36,6 +36,14 @@ export interface SubmissionPayload {
 	references?: string[];
 }
 
+/** Raised when a request id is reused with a different payload. */
+export class SubmissionReuseError extends Error {
+	constructor(requestId: string) {
+		super(`Request id ${requestId} was already used with different content`);
+		this.name = "SubmissionReuseError";
+	}
+}
+
 /** Canonical, order-stable view of the payload so the same intent always hashes the same. */
 function canonicalize(payload: SubmissionPayload): string {
 	const norm = (list?: string[]): string[] => (list ?? []).map((a) => a.trim().toLowerCase()).filter(Boolean);
@@ -91,7 +99,15 @@ export class SubmissionStore {
 		const requestId = idempotencyKeyFor(payload);
 		const hash = payloadHash(payload);
 		const existing = this.getIntent(requestId);
-		if (existing) return existing;
+		if (existing) {
+			// Same key must mean the same message. A differing payload under an
+			// existing key is a client bug or an attack; refuse rather than send
+			// the wrong content under a key the provider may have already seen.
+			if (existing.payload_hash !== hash) {
+				throw new SubmissionReuseError(requestId);
+			}
+			return existing;
+		}
 
 		const at = now(this.#clock);
 		this.#db
@@ -176,4 +192,72 @@ export class SubmissionStore {
 			)
 			.run(state, providerId, lastError, now(this.#clock), requestId);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 15: relay submission with idempotency carried across retries.
+//
+// The transport is injected so tests can simulate acceptance ambiguity and
+// restarts without a live relay. The production transport talks to Stalwart's
+// authenticated submission path (see deploy/stalwart/README.md); it MUST carry
+// the `request_id` as the provider idempotency header on every attempt.
+// ---------------------------------------------------------------------------
+
+export type RelayOutcome =
+	| { status: "accepted"; providerId: string }
+	| { status: "rejected"; reason: string }
+	/** The relay may or may not have accepted; caller must hold and reconcile. */
+	| { status: "ambiguous"; reason: string };
+
+export interface RelayRequest {
+	requestId: string;
+	idempotencyHeader: { name: string; value: string };
+	payload: SubmissionPayload;
+}
+
+export interface RelayTransport {
+	/** Post one submission attempt. Must never throw for a *known* rejection. */
+	send(request: RelayRequest): Promise<RelayOutcome>;
+}
+
+export interface SubmitResult {
+	requestId: string;
+	state: SubmissionIntent["state"];
+	providerId: string | null;
+}
+
+/**
+ * Drive one submission to a terminal-ish state with idempotent retry.
+ *
+ * - The intent is created (durable) BEFORE the transport is called.
+ * - If the intent is already submitted/accepted, the transport is NOT called.
+ * - An ambiguous outcome is recorded `unknown` and returned as such; it is not
+ *   retried here — a later reconcile() resolves it.
+ * - A known rejection never consumes a retry and is recorded `failed`.
+ */
+export async function submitWithIdempotency(
+	store: SubmissionStore,
+	transport: RelayTransport,
+	payload: SubmissionPayload,
+): Promise<SubmitResult> {
+	const intent = store.createIntent(payload);
+	if (!store.canSubmit(intent.request_id)) {
+		// Already handed to the relay: do not send again.
+		return { requestId: intent.request_id, state: intent.state, providerId: intent.provider_id };
+	}
+
+	store.markSubmitted(intent.request_id);
+	const idempotencyHeader = { name: "Idempotency-Key", value: intent.request_id };
+	const outcome = await transport.send({ requestId: intent.request_id, idempotencyHeader, payload });
+
+	if (outcome.status === "accepted") {
+		store.markAccepted(intent.request_id, outcome.providerId);
+		return { requestId: intent.request_id, state: "accepted", providerId: outcome.providerId };
+	}
+	if (outcome.status === "rejected") {
+		store.markFailed(intent.request_id, outcome.reason);
+		return { requestId: intent.request_id, state: "failed", providerId: null };
+	}
+	store.markUnknown(intent.request_id, outcome.reason);
+	return { requestId: intent.request_id, state: "unknown", providerId: null };
 }
