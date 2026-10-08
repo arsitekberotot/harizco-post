@@ -1,0 +1,27 @@
+# Cloudflare Tunnel ingress for harizco-post.
+#
+# Routes ONLY mail.atelieriza.com -> the app (loopback :3000). The app itself
+# pins HOST=127.0.0.1, so the tunnel is the sole public entry point.
+#
+# Deliberately absent: any ingress to Stalwart's 8080, its WebUI, JMAP, SMTP,
+# the relay (8788), or the database. They stay loopback-only; adding a hostname
+# for them here would bypass the Access policy below.
+#
+# Credentials file for tunnel 919b6542-454f-4774-ace7-a0ed57a7e604 lives in
+# ~/.cloudflared/ (mode 0400/0600). Never commit it.
+
+tunnel: 919b6542-454f-4774-ace7-a0ed57a7e604
+credentials-file: /home/<user>/.cloudflared/<tunnel-id>.json
+
+# Keep origin unencrypted only over loopback; the public leg is HTTPS at the
+# Cloudflare edge.
+originRequest:
+  connectTimeout: 30s
+  noTLSVerify: false
+
+ingress:
+  - hostname: mail.atelieriza.com
+    service: http://127.0.0.1:3000
+  # Catch-all: anything not matched above is refused rather than sent to a
+  # default origin.
+  - service: http_status:404
