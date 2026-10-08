@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 
 import { createApp, type CreateAppOptions } from "./app";
 import { loadConfig, type AppConfig } from "./config";
-import type { MailBackend } from "./mail/backend";
+import type { MailBackend, ConfiguredAddresses } from "./mail/backend";
 import { JmapMailBackend } from "./mail/backend-jmap";
 import { SubmissionStore } from "./mail/submissions";
 import type { RelayOutcome, RelayRequest, RelayTransport } from "./mail/submissions";
@@ -87,6 +87,24 @@ export function createProductionBackend(
 		...(options.fetch ? { fetch: options.fetch } : {}),
 		...(submission ? { submission } : {}),
 	});
+}
+
+/**
+ * Derive the operator-provisioned address map returned by GET /api/v1/config
+ * from the validated outbound binding.
+ *
+ * The binding is the single authoritative source of the owned sender identity:
+ * `OUTBOUND_FROM` is validated at startup and its `domain` is derived from that
+ * same address. The UI needs this to populate the mailbox-domain picker and to
+ * enable Create. Without a binding there is no owned identity, so we return
+ * undefined and the config route keeps its honest empty list rather than
+ * inventing a domain.
+ */
+export function configuredAddressesFrom(
+	binding: OutboundBinding | null,
+): ConfiguredAddresses | undefined {
+	if (!binding || !binding.address || !binding.domain) return undefined;
+	return { domains: [binding.domain], emailAddresses: [binding.address] };
 }
 
 /**
@@ -169,7 +187,11 @@ export async function start() {
   // A validated mailbox binding turns on real private reads; without it the
   // handler keeps its honest 503 rather than fabricating mail.
   const backend = createProductionBackend(config);
-  const fetch = createProductionHandler({ config, clientDir, ...(backend ? { backend } : {}) });
+  // GET /api/v1/config must report the owned sender domain/address so the UI can
+  // populate its mailbox-domain picker; derive it from the same validated
+  // binding the submission path uses. Absent a binding, stays undefined.
+  const addresses = configuredAddressesFrom(loadOutboundBinding(process.env));
+  const fetch = createProductionHandler({ config, clientDir, ...(backend ? { backend } : {}), ...(addresses ? { addresses } : {}) });
   const { serve } = await import("@hono/node-server");
   // Keep native Web API globals: the adapter's default shims affect unrelated code.
   return serve({ hostname: config.host, port: config.port, fetch, overrideGlobalObjects: false }, info => {

@@ -6,6 +6,7 @@
 
 import { describe, expect, test } from "vitest";
 import { loadOutboundBinding } from "../../server/config";
+import { configuredAddressesFrom } from "../../server/index";
 
 describe("loadOutboundBinding", () => {
 	test("returns null when nothing is configured (send stays disabled)", () => {
@@ -37,5 +38,26 @@ describe("loadOutboundBinding", () => {
 	test("carries no provider secret: only a relay URL and sender identity", () => {
 		const binding = loadOutboundBinding({ OUTBOUND_FROM: "a@b.test", OUTBOUND_RELAY_URL: "http://x.test", RESEND_API_KEY: "leaky" });
 		expect(JSON.stringify(binding)).not.toContain("leaky");
+	});
+});
+
+// GET /api/v1/config feeds the UI's mailbox-domain picker. If this derivation
+// regresses the picker goes empty and Create stays disabled ("@ no domain"),
+// even though the sender identity is perfectly valid.
+describe("configuredAddressesFrom", () => {
+	test("reports the owned domain and address from the binding", () => {
+		const binding = loadOutboundBinding({ OUTBOUND_FROM: "hanif@atelieriza.com", OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit" });
+		expect(configuredAddressesFrom(binding)).toEqual({
+			domains: ["atelieriza.com"],
+			emailAddresses: ["hanif@atelieriza.com"],
+		});
+	});
+
+	test("returns undefined when there is no binding, so the route stays honest", () => {
+		expect(configuredAddressesFrom(null)).toBeUndefined();
+	});
+
+	test("refuses to invent a domain from a blank binding", () => {
+		expect(configuredAddressesFrom({ address: "", domain: "" } as never)).toBeUndefined();
 	});
 });
