@@ -62,6 +62,11 @@ export class JmapImportAdapter implements JmapImportPort {
 	async importEmail(input: { mailboxId: string; blobId: string; bytes: Uint8Array }): Promise<{ emailId: string }> {
 		void input.bytes;
 		const accountId = await this.#accountId();
+		if (input.mailboxId !== accountId) {
+			throw new JmapError("account_mismatch", "Import target does not match this JMAP adapter's bound account.");
+		}
+		const inbox = (await this.#client.listMailboxes()).find((mailbox) => mailbox.systemRole === "inbox");
+		if (!inbox) throw new JmapError("missing_inbox", "The bound JMAP account has no Inbox mailbox.");
 		const responses = await this.#client.request([
 			[
 				"Email/import",
@@ -70,7 +75,7 @@ export class JmapImportAdapter implements JmapImportPort {
 					emails: {
 						imported: {
 							blobId: input.blobId,
-							mailboxIds: { [input.mailboxId]: true },
+							mailboxIds: { [inbox.id]: true },
 							keywords: this.#keywords,
 						},
 					},

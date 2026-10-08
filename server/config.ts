@@ -206,6 +206,8 @@ export interface OutboundBinding {
 	readonly dbPath: string;
 	/** Owned sender address every From must match. */
 	readonly address: string;
+	/** All operator-configured addresses on this owned domain. */
+	readonly addresses: readonly string[];
 	/** Owned domain every From must be on (defaults from the address). */
 	readonly domain: string;
 	/** Max total recipients across To+Cc+Bcc. */
@@ -218,6 +220,7 @@ export interface OutboundBinding {
 
 const DEFAULT_MAX_RECIPIENTS = 20;
 const DEFAULT_MAX_BYTES = 5_000_000;
+const OUTBOUND_ADDRESS_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 
 /**
  * Load the optional outbound submission binding.
@@ -227,18 +230,32 @@ const DEFAULT_MAX_BYTES = 5_000_000;
  * silently send From the wrong address.
  */
 export function loadOutboundBinding(env: Record<string, string | undefined> = {}): OutboundBinding | null {
-	const address = (env.OUTBOUND_FROM ?? "").trim();
+	const rawAddress = (env.OUTBOUND_FROM ?? "").trim();
 	const relayUrl = (env.OUTBOUND_RELAY_URL ?? "").trim();
-	if (!address && !relayUrl) return null;
-	if (!address || !relayUrl) {
+	if (!rawAddress && !relayUrl) return null;
+	if (!rawAddress || !relayUrl) {
 		throw new Error("Incomplete outbound binding: OUTBOUND_FROM and OUTBOUND_RELAY_URL must both be set");
 	}
-	if (!/^[^@\s]+@[^@\s]+$/.test(address)) throw new Error("Invalid OUTBOUND_FROM: expected a single email address");
+	const address = rawAddress.toLowerCase();
+	if (!OUTBOUND_ADDRESS_RE.test(address)) throw new Error("Invalid OUTBOUND_FROM: expected a single email address");
 	if (!/^https?:\/\//.test(relayUrl)) throw new Error("Invalid OUTBOUND_RELAY_URL: expected an http(s) URL");
 	const domain = (env.OUTBOUND_DOMAIN ?? address.split("@")[1] ?? "").trim().toLowerCase();
+	const rawAddresses = env.OUTBOUND_ADDRESSES;
+	const addresses = rawAddresses === undefined
+		? [address]
+		: rawAddresses.split(",").map((item) => item.trim().toLowerCase());
+	if (
+		addresses.length === 0 ||
+		addresses.some((item) => !OUTBOUND_ADDRESS_RE.test(item) || item.split("@")[1] !== domain) ||
+		new Set(addresses).size !== addresses.length ||
+		!addresses.includes(address)
+	) {
+		throw new Error("Invalid OUTBOUND_ADDRESSES: expected unique addresses on the owned domain, including OUTBOUND_FROM");
+	}
 	return {
 		dbPath: (env.SYNC_DB_PATH ?? env.DB_PATH ?? "var/harizco-post.sqlite").trim(),
-		address: address.toLowerCase(),
+		address,
+		addresses,
 		domain,
 		maxRecipients: intOrDefault(env.OUTBOUND_MAX_RECIPIENTS, DEFAULT_MAX_RECIPIENTS),
 		maxBytes: intOrDefault(env.OUTBOUND_MAX_BYTES, DEFAULT_MAX_BYTES),

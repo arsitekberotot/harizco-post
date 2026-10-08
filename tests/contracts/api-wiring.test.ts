@@ -7,6 +7,8 @@
 // server/app.ts only serves /health and denies every private route.
 
 import { beforeEach, describe, expect, test } from "vitest";
+import { openJournal } from "../../server/db/index";
+import { MailboxRegistry } from "../../server/mailboxes/registry";
 import { createTestApp } from "../helpers/app";
 import type {
 	MailBackend,
@@ -134,6 +136,161 @@ describe("Phase 2: compatibility API forwards to the MailBackend", () => {
 		const body = (await res.json()) as { id: string }[];
 		expect(body.map((m) => m.id)).toEqual(["mb-inbox", "mb-sent"]);
 		expect(backend.calls).toContain("listMailboxes");
+	});
+
+	test("multi-account mode lists only configured identities, not JMAP folders", async () => {
+		const hanif = fakeBackend();
+		const natla = fakeBackend();
+		const { app } = createTestApp({
+			authMode: "fixture",
+				addresses: { domains: ["atelieriza.com"], emailAddresses: ["hanif@atelieriza.com", "natla@atelieriza.com"] },
+				mailboxBackends: new Map([["hanif@atelieriza.com", hanif], ["natla@atelieriza.com", natla]]),
+		});
+		const res = await app.request("/api/v1/mailboxes");
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual([
+			{ id: "hanif@atelieriza.com", email: "hanif@atelieriza.com", name: "hanif" },
+			{ id: "natla@atelieriza.com", email: "natla@atelieriza.com", name: "natla" },
+		]);
+		expect(hanif.calls).toEqual([]);
+		expect(natla.calls).toEqual([]);
+	});
+
+	test("POST /api/v1/mailboxes activates only a pre-provisioned configured address", async () => {
+		const db = openJournal(":memory:");
+		const registry = new MailboxRegistry(db);
+		registry.provision({ id: "mb-hanif", address: "hanif@atelieriza.com" });
+		registry.bindAccount("mb-hanif", "acct-hanif");
+		registry.setEnabled("mb-hanif", true);
+		registry.provision({ id: "mb-natla", address: "natla@atelieriza.com" });
+		registry.bindAccount("mb-natla", "acct-natla");
+		const { app } = createTestApp({
+			authMode: "fixture",
+			addresses: { domains: ["atelieriza.com"], emailAddresses: ["hanif@atelieriza.com", "natla@atelieriza.com"] },
+			mailboxBackends: new Map([["hanif@atelieriza.com", fakeBackend()], ["natla@atelieriza.com", fakeBackend()]]),
+			mailboxRegistry: registry,
+		});
+
+		const before = await app.request("/api/v1/mailboxes");
+		expect((await before.json()).map((mailbox: { email: string }) => mailbox.email)).toEqual(["hanif@atelieriza.com"]);
+		const disabledAccess = await app.request("/api/v1/mailboxes/natla%40atelieriza.com");
+		expect(disabledAccess.status).toBe(404);
+
+		const res = await app.request("/api/v1/mailboxes", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ email: "natla@atelieriza.com", name: "Natla" }),
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ id: "natla@atelieriza.com", email: "natla@atelieriza.com", name: "Natla" });
+		expect(registry.getByAddress("natla@atelieriza.com")?.enabled).toBe(1);
+		expect(registry.listAll()).toHaveLength(2);
+		const after = await app.request("/api/v1/mailboxes");
+		expect((await after.json()).map((mailbox: { email: string }) => mailbox.email).sort()).toEqual([
+			"hanif@atelieriza.com",
+			"natla@atelieriza.com",
+		]);
+		db.close();
+	});
+
+	test("DELETE /api/v1/mailboxes disables the registry binding without deleting it", async () => {
+		const db = openJournal(":memory:");
+		const registry = new MailboxRegistry(db);
+		registry.provision({ id: "mb-hanif", address: "hanif@atelieriza.com" });
+		registry.bindAccount("mb-hanif", "acct-hanif");
+		registry.setEnabled("mb-hanif", true);
+		const { app } = createTestApp({
+			authMode: "fixture",
+				addresses: { domains: ["atelieriza.com"], emailAddresses: ["hanif@atelieriza.com"] },
+				mailboxBackends: new Map([["hanif@atelieriza.com", fakeBackend()]]),
+				mailboxRegistry: registry,
+		});
+
+		const res = await app.request("/api/v1/mailboxes/hanif%40atelieriza.com", { method: "DELETE" });
+		expect(res.status).toBe(204);
+		expect(registry.getByAddress("hanif@atelieriza.com")?.enabled).toBe(0);
+		expect(registry.getById("mb-hanif")).toBeDefined();
+		const list = await app.request("/api/v1/mailboxes");
+		expect(await list.json()).toEqual([]);
+		const inaccessible = await app.request("/api/v1/mailboxes/hanif%40atelieriza.com");
+		expect(inaccessible.status).toBe(404);
+		db.close();
+	});
+
+	test("POST refuses a configured identity without a pre-provisioned JMAP binding", async () => {
+		const db = openJournal(":memory:");
+		const registry = new MailboxRegistry(db);
+		const { app } = createTestApp({
+			authMode: "fixture",
+			addresses: { domains: ["atelieriza.com"], emailAddresses: ["natla@atelieriza.com"] },
+			mailboxBackends: new Map([["natla@atelieriza.com", fakeBackend()]]),
+			mailboxRegistry: registry,
+		});
+
+		const res = await app.request("/api/v1/mailboxes", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ email: "natla@atelieriza.com", name: "Natla" }),
+		});
+		expect(res.status).toBe(404);
+		expect(registry.listAll()).toEqual([]);
+		db.close();
+	});
+
+	test("POST refuses an address not in the operator-configured address list", async () => {
+		const db = openJournal(":memory:");
+		const registry = new MailboxRegistry(db);
+		registry.provision({ id: "mb-outsider", address: "outsider@atelieriza.com" });
+		registry.bindAccount("mb-outsider", "acct-outsider");
+		const { app } = createTestApp({
+			authMode: "fixture",
+			addresses: { domains: ["atelieriza.com"], emailAddresses: ["hanif@atelieriza.com"] },
+			mailboxBackends: new Map([
+				["hanif@atelieriza.com", fakeBackend()],
+				["outsider@atelieriza.com", fakeBackend()],
+			]),
+			mailboxRegistry: registry,
+		});
+
+		const res = await app.request("/api/v1/mailboxes", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ email: "outsider@atelieriza.com", name: "Outsider" }),
+		});
+		expect(res.status).toBe(404);
+		expect(registry.getByAddress("outsider@atelieriza.com")?.enabled).toBe(0);
+		db.close();
+	});
+
+	test("multi-account requests use only the selected account backend and folder query", async () => {
+		const hanif = fakeBackend();
+		const natla = fakeBackend();
+		const { app } = createTestApp({
+			authMode: "fixture",
+				addresses: { domains: ["atelieriza.com"], emailAddresses: ["hanif@atelieriza.com", "natla@atelieriza.com"] },
+				mailboxBackends: new Map([["hanif@atelieriza.com", hanif], ["natla@atelieriza.com", natla]]),
+		});
+		const folderRes = await app.request("/api/v1/mailboxes/natla%40atelieriza.com/folders");
+		expect(folderRes.status).toBe(200);
+		expect(natla.calls).toContain("listMailboxes");
+		expect(hanif.calls).not.toContain("listMailboxes");
+
+		const emailsRes = await app.request("/api/v1/mailboxes/natla%40atelieriza.com/emails?folder=mb-inbox");
+		expect(emailsRes.status).toBe(200);
+		expect(natla.calls).toContain("listEmails:mb-inbox");
+		expect(hanif.calls.some((call) => call.startsWith("listEmails:"))).toBe(false);
+	});
+
+	test("multi-account mode fails closed for an unconfigured address", async () => {
+		const hanif = fakeBackend();
+		const { app } = createTestApp({
+			authMode: "fixture",
+				addresses: { domains: ["atelieriza.com"], emailAddresses: ["hanif@atelieriza.com"] },
+				mailboxBackends: new Map([["hanif@atelieriza.com", hanif]]),
+		});
+		const res = await app.request("/api/v1/mailboxes/outsider%40atelieriza.com/folders");
+		expect(res.status).toBe(404);
+		expect(hanif.calls).toEqual([]);
 	});
 
 	test("GET /api/v1/mailboxes/:id/emails lists scoped messages", async () => {

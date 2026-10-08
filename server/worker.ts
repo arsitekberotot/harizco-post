@@ -39,20 +39,35 @@ async function main(): Promise<void> {
 
 	const spool = new FsSpool({ dir: config.spoolDir });
 
-	const importer = new JmapImportAdapter({
-		baseUrl: config.stalwartUrl,
-		auth: { username: config.stalwartUsername, secret: config.stalwartSecret },
-		...(config.stalwartAccountId ? { accountId: config.stalwartAccountId } : {}),
-	});
+	const importers = new Map<string, JmapImportAdapter>();
+	for (const mailbox of registry.listEnabled()) {
+		if (!mailbox.jmap_account_id) throw new Error(`Enabled mailbox ${mailbox.id} has no JMAP account binding.`);
+	}
+	const jmapForMailbox = (mailboxId: string): JmapImportAdapter => {
+		const mailbox = registry.getById(mailboxId);
+		if (!mailbox || mailbox.enabled !== 1) {
+			throw new Error(`Mailbox ${mailboxId} is not enabled for inbound import.`);
+		}
+		const accountId = mailbox.jmap_account_id;
+		if (!accountId) throw new Error(`Enabled mailbox ${mailbox.id} has no JMAP account binding.`);
+		let importer = importers.get(mailboxId);
+		if (!importer) {
+			importer = new JmapImportAdapter({
+				baseUrl: config.stalwartUrl,
+				auth: { username: config.stalwartUsername, secret: config.stalwartSecret },
+				accountId,
+			});
+			importers.set(mailboxId, importer);
+		}
+		return importer;
+	};
 
 	const imports = new ImportPipeline({
 		db,
 		router,
 		spool,
-		jmap: importer,
-		// A mailbox row carries its own JMAP account binding; fall back to the
-		// configured default so an unbound mailbox is still importable.
-		mailboxIdResolver: () => config.stalwartAccountId ?? "primary",
+		jmapForMailbox,
+		mailboxIdResolver: (mailboxId) => registry.getById(mailboxId)?.jmap_account_id ?? "",
 	});
 
 	const discovery = new DiscoveryService({ db, router, checkpoints });

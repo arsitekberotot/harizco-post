@@ -15,6 +15,8 @@
 // These are RED until server/mail/submissions.ts exists (module not found).
 
 import { beforeEach, describe, expect, test } from "vitest";
+import { loadOutboundBinding } from "../../server/config";
+import { senderPolicyForAddress } from "../../server/index";
 import { openJournal, type Journal } from "../../server/db/index";
 import {
 	SubmissionStore,
@@ -153,6 +155,18 @@ describe("submission lifecycle", () => {
 });
 
 describe("submission validation (reject before any side effect)", () => {
+	test("each mailbox can send as itself but not as another address on the same domain", () => {
+		const binding = loadOutboundBinding({
+			OUTBOUND_FROM: "hanif@atelieriza.com",
+			OUTBOUND_ADDRESSES: "hanif@atelieriza.com,natla@atelieriza.com",
+			OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit",
+		});
+		const natlaPolicy = senderPolicyForAddress(binding!, "natla@atelieriza.com");
+		const ownSend = { ...payload, mailboxId: "natla@atelieriza.com", from: "natla@atelieriza.com" };
+		expect(() => validateSubmission(ownSend, natlaPolicy)).not.toThrow();
+		expect(() => validateSubmission({ ...ownSend, from: "hanif@atelieriza.com" }, natlaPolicy)).toThrow(/selected mailbox/i);
+	});
+
 	test("a valid submission passes and does not touch the backend", async () => {
 		const backend = countingBackend();
 		const result = validateSubmission(payload, policy);

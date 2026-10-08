@@ -16,7 +16,8 @@ import { JmapMailBackend } from "./mail/backend-jmap";
 import { SubmissionStore } from "./mail/submissions";
 import type { RelayOutcome, RelayRequest, RelayTransport } from "./mail/submissions";
 import type { SenderPolicy } from "./mail/validation";
-import { openJournal } from "./db/index";
+import { openJournal, type Journal, type MailboxRecord } from "./db/index";
+import { MailboxRegistry } from "./mailboxes/registry";
 import { loadOutboundBinding, type OutboundBinding } from "./config";
 import { privateError } from "./auth/request";
 
@@ -79,7 +80,7 @@ export function createProductionBackend(
 ): MailBackend | null {
 	const mailbox = config.mailbox;
 	if (!mailbox) return null;
-	const submission = createSubmissionWiring(config);
+	const submission = createSubmissionWiring();
 	return new JmapMailBackend({
 		baseUrl: mailbox.url,
 		auth: { username: mailbox.username, secret: mailbox.secret },
@@ -87,6 +88,67 @@ export function createProductionBackend(
 		...(options.fetch ? { fetch: options.fetch } : {}),
 		...(submission ? { submission } : {}),
 	});
+}
+
+/**
+ * Build one JMAP client and sender policy per configured, operator-bound mailbox.
+ *
+ * `records` must come from the mailbox registry. Every configured address must
+ * have exactly one JMAP account binding; disabled records are prepared here but
+ * remain inaccessible until explicitly activated in the registry.
+ */
+export function createProductionMailboxBackends(
+	config: AppConfig,
+	records: readonly MailboxRecord[],
+	binding: OutboundBinding | null,
+	options: {
+		fetch?: typeof fetch;
+		db?: Journal;
+		store?: SubmissionStore;
+		transport?: RelayTransport;
+	} = {},
+): Map<string, MailBackend> {
+	const mailbox = config.mailbox;
+	const backends = new Map<string, MailBackend>();
+	if (!mailbox) return backends;
+
+	const boundByAddress = new Map(
+		records
+			.filter((record) => !!record.jmap_account_id)
+			.map((record) => [record.address.trim().toLowerCase(), record]),
+	);
+	const addresses = binding?.addresses ?? [...boundByAddress.keys()];
+	const accountOwners = new Map<string, string>();
+	for (const address of addresses) {
+		const record = boundByAddress.get(address);
+		if (!record?.jmap_account_id) {
+			throw new Error(`Configured mailbox ${address} has no JMAP account binding.`);
+		}
+		const priorAddress = accountOwners.get(record.jmap_account_id);
+		if (priorAddress) {
+			throw new Error(`JMAP account is bound to multiple mailboxes: ${priorAddress}, ${address}`);
+		}
+		accountOwners.set(record.jmap_account_id, address);
+	}
+
+	const store = binding
+		? options.store ?? new SubmissionStore(options.db ?? openJournal(binding.dbPath))
+		: undefined;
+	const transport = binding ? options.transport ?? new HttpRelayTransport(binding.relayUrl) : undefined;
+	for (const address of addresses) {
+		const record = boundByAddress.get(address)!;
+		const submission = binding && store && transport
+			? { store, transport, policy: senderPolicyForAddress(binding, address) }
+			: undefined;
+		backends.set(address, new JmapMailBackend({
+			baseUrl: mailbox.url,
+			auth: { username: mailbox.username, secret: mailbox.secret },
+			accountId: record.jmap_account_id!,
+			...(options.fetch ? { fetch: options.fetch } : {}),
+			...(submission ? { submission } : {}),
+		}));
+	}
+	return backends;
 }
 
 /**
@@ -103,8 +165,23 @@ export function createProductionBackend(
 export function configuredAddressesFrom(
 	binding: OutboundBinding | null,
 ): ConfiguredAddresses | undefined {
-	if (!binding || !binding.address || !binding.domain) return undefined;
-	return { domains: [binding.domain], emailAddresses: [binding.address] };
+	if (!binding || !binding.addresses?.length || !binding.domain) return undefined;
+	return { domains: [binding.domain], emailAddresses: [...binding.addresses] };
+}
+
+/** Build a sender policy bound to one configured account, never an alias set. */
+export function senderPolicyForAddress(binding: OutboundBinding, mailboxAddress: string): SenderPolicy {
+	const address = mailboxAddress.trim().toLowerCase();
+	if (!binding.addresses.includes(address)) {
+		throw new Error("Mailbox address is not configured for sending");
+	}
+	return {
+		mailboxId: address,
+		address,
+		domain: binding.domain,
+		maxRecipients: binding.maxRecipients,
+		maxBytes: binding.maxBytes,
+	};
 }
 
 /**
@@ -115,19 +192,13 @@ export function configuredAddressesFrom(
  * the worker owns. Absent a binding, `sendEmail` refuses honestly.
  */
 function createSubmissionWiring(
-	config: AppConfig,
+	mailboxAddress?: string,
 ): { store: SubmissionStore; transport: RelayTransport; policy: SenderPolicy } | null {
 	const binding: OutboundBinding | null = loadOutboundBinding(process.env);
 	if (!binding) return null;
 	const store = new SubmissionStore(openJournal(binding.dbPath));
 	const transport = new HttpRelayTransport(binding.relayUrl);
-	const policy: SenderPolicy = {
-		mailboxId: config.mailbox?.accountId ?? "primary",
-		address: binding.address,
-		domain: binding.domain,
-		maxRecipients: binding.maxRecipients,
-		maxBytes: binding.maxBytes,
-	};
+	const policy = senderPolicyForAddress(binding, mailboxAddress ?? binding.address);
 	return { store, transport, policy };
 }
 
@@ -184,14 +255,34 @@ export async function start() {
   const config = loadConfig(process.env);
   const clientDir = resolve(process.env.CLIENT_DIR ?? "dist/client");
   if (!existsSync(clientDir)) throw new Error("Built client bundle missing; run npm run build");
-  // A validated mailbox binding turns on real private reads; without it the
-  // handler keeps its honest 503 rather than fabricating mail.
-  const backend = createProductionBackend(config);
-  // GET /api/v1/config must report the owned sender domain/address so the UI can
-  // populate its mailbox-domain picker; derive it from the same validated
-  // binding the submission path uses. Absent a binding, stays undefined.
-  const addresses = configuredAddressesFrom(loadOutboundBinding(process.env));
-  const fetch = createProductionHandler({ config, clientDir, ...(backend ? { backend } : {}), ...(addresses ? { addresses } : {}) });
+  // A configured address list is usable only when the persistent registry has
+  // one distinct JMAP account binding per address. Browser activation is limited
+  // to those pre-provisioned rows; multi-mailbox mode never aliases inboxes.
+  const outboundBinding = loadOutboundBinding(process.env);
+  if (outboundBinding && !config.mailbox) {
+    throw new Error("Outbound mailbox identities require a configured Stalwart JMAP binding.");
+  }
+  const addresses = configuredAddressesFrom(outboundBinding);
+  let backend: MailBackend | null = null;
+  let mailboxBackends: Map<string, MailBackend> | undefined;
+  let mailboxRegistry: MailboxRegistry | undefined;
+  if (config.mailbox && outboundBinding) {
+    const db = openJournal(outboundBinding.dbPath);
+    mailboxRegistry = new MailboxRegistry(db);
+    mailboxBackends = createProductionMailboxBackends(config, mailboxRegistry.listAll(), outboundBinding, { db });
+  } else if (!outboundBinding) {
+    // Preserve the legacy single-account read path when outbound identities
+    // are not configured. Sending remains refused without a sender binding.
+    backend = createProductionBackend(config);
+  }
+  const fetch = createProductionHandler({
+    config,
+    clientDir,
+    ...(backend ? { backend } : {}),
+    ...(mailboxBackends ? { mailboxBackends } : {}),
+    ...(mailboxRegistry ? { mailboxRegistry } : {}),
+    ...(addresses ? { addresses } : {}),
+  });
   const { serve } = await import("@hono/node-server");
   // Keep native Web API globals: the adapter's default shims affect unrelated code.
   return serve({ hostname: config.host, port: config.port, fetch, overrideGlobalObjects: false }, info => {

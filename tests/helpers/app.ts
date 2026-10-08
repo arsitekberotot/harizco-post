@@ -15,6 +15,7 @@ import type { Hono } from "hono";
 import type { MailStore } from "../../server/app";
 import type { MailBackend, ConfiguredAddresses } from "../../server/mail/backend";
 import type { AppConfig } from "../../server/config";
+import type { MailboxRegistry } from "../../server/mailboxes/registry";
 import type { StatusReport } from "../../server/routes/status";
 
 // Collect the individual contracts even before the planned modules exist.
@@ -61,6 +62,10 @@ export type CreateTestAppOptions = {
 	env?: Record<string, string | undefined>;
 	/** Real mail backend (Phase 2+). Absent => honest 503 on private reads. */
 	backend?: MailBackend;
+	/** Per-address, account-scoped adapters; no fallback to another mailbox. */
+	mailboxBackends?: ReadonlyMap<string, MailBackend>;
+	/** Operator registry: browser operations may activate/deactivate only existing bindings. */
+	mailboxRegistry?: MailboxRegistry;
 	/** Operator-provisioned addresses returned by GET /api/v1/config. */
 	addresses?: ConfiguredAddresses;
 	/** Sync/import status source for GET /api/v1/status. */
@@ -127,6 +132,8 @@ export function createTestApp(
 		authMode,
 		mailStore,
 		...(options.backend ? { backend: options.backend } : {}),
+		...(options.mailboxBackends ? { mailboxBackends: options.mailboxBackends } : {}),
+		...(options.mailboxRegistry ? { mailboxRegistry: options.mailboxRegistry } : {}),
 		...(options.addresses ? { addresses: options.addresses } : {}),
 		...(options.statusProvider ? { statusProvider: options.statusProvider } : {}),
 	});

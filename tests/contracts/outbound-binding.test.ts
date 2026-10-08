@@ -6,7 +6,7 @@
 
 import { describe, expect, test } from "vitest";
 import { loadOutboundBinding } from "../../server/config";
-import { configuredAddressesFrom } from "../../server/index";
+import { configuredAddressesFrom, senderPolicyForAddress } from "../../server/index";
 
 describe("loadOutboundBinding", () => {
 	test("returns null when nothing is configured (send stays disabled)", () => {
@@ -25,9 +25,34 @@ describe("loadOutboundBinding", () => {
 		});
 		expect(binding).not.toBeNull();
 		expect(binding!.address).toBe("hanif@atelieriza.com");
+		expect(binding!.addresses).toEqual(["hanif@atelieriza.com"]);
 		expect(binding!.domain).toBe("atelieriza.com");
 		expect(binding!.relayUrl).toBe("http://127.0.0.1:8788/submit");
 		expect(binding!.maxRecipients).toBe(20);
+	});
+
+	test("parses any number of configured same-domain addresses", () => {
+		const binding = loadOutboundBinding({
+			OUTBOUND_FROM: "hanif@atelieriza.com",
+			OUTBOUND_ADDRESSES: "hanif@atelieriza.com, natla@atelieriza.com, info@atelieriza.com",
+			OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit",
+		});
+		expect(binding?.addresses).toEqual([
+			"hanif@atelieriza.com",
+			"natla@atelieriza.com",
+			"info@atelieriza.com",
+		]);
+	});
+
+	test("rejects malformed, duplicate, foreign-domain, or primary-omitting address lists", () => {
+		const base = {
+			OUTBOUND_FROM: "hanif@atelieriza.com",
+			OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit",
+		};
+		expect(() => loadOutboundBinding({ ...base, OUTBOUND_ADDRESSES: "hanif@atelieriza.com,natla" })).toThrow(/OUTBOUND_ADDRESSES/i);
+		expect(() => loadOutboundBinding({ ...base, OUTBOUND_ADDRESSES: "hanif@atelieriza.com,hanif@atelieriza.com" })).toThrow(/OUTBOUND_ADDRESSES/i);
+		expect(() => loadOutboundBinding({ ...base, OUTBOUND_ADDRESSES: "hanif@atelieriza.com,natla@example.test" })).toThrow(/OUTBOUND_ADDRESSES/i);
+		expect(() => loadOutboundBinding({ ...base, OUTBOUND_ADDRESSES: "natla@atelieriza.com" })).toThrow(/OUTBOUND_ADDRESSES/i);
 	});
 
 	test("rejects a non-URL relay and a malformed address", () => {
@@ -45,12 +70,31 @@ describe("loadOutboundBinding", () => {
 // regresses the picker goes empty and Create stays disabled ("@ no domain"),
 // even though the sender identity is perfectly valid.
 describe("configuredAddressesFrom", () => {
-	test("reports the owned domain and address from the binding", () => {
-		const binding = loadOutboundBinding({ OUTBOUND_FROM: "hanif@atelieriza.com", OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit" });
+	test("reports every configured address and the owned domain", () => {
+		const binding = loadOutboundBinding({
+			OUTBOUND_FROM: "hanif@atelieriza.com",
+			OUTBOUND_ADDRESSES: "hanif@atelieriza.com,natla@atelieriza.com,info@atelieriza.com",
+			OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit",
+		});
 		expect(configuredAddressesFrom(binding)).toEqual({
 			domains: ["atelieriza.com"],
-			emailAddresses: ["hanif@atelieriza.com"],
+			emailAddresses: ["hanif@atelieriza.com", "natla@atelieriza.com", "info@atelieriza.com"],
 		});
+	});
+
+	test("creates an exact sender policy for each configured mailbox", () => {
+		const binding = loadOutboundBinding({
+			OUTBOUND_FROM: "hanif@atelieriza.com",
+			OUTBOUND_ADDRESSES: "hanif@atelieriza.com,natla@atelieriza.com",
+			OUTBOUND_RELAY_URL: "http://127.0.0.1:8788/submit",
+		});
+		const policy = senderPolicyForAddress(binding!, "natla@atelieriza.com");
+		expect(policy).toMatchObject({
+			mailboxId: "natla@atelieriza.com",
+			address: "natla@atelieriza.com",
+			domain: "atelieriza.com",
+		});
+		expect(() => senderPolicyForAddress(binding!, "outsider@atelieriza.com")).toThrow(/not configured/i);
 	});
 
 	test("returns undefined when there is no binding, so the route stays honest", () => {

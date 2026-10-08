@@ -14,7 +14,7 @@ import {
 } from "@cloudflare/kumo";
 import { EnvelopeIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react";
 import { useQuery } from "@tanstack/react-query";
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { Link as RouterLink } from "react-router";
 import api from "~/services/api";
 import {
@@ -30,7 +30,7 @@ export function meta() {
 
 export default function HomeRoute() {
 	const toastManager = useKumoToastManager();
-	const { data: mailboxes = [], refetch: refetchMailboxes, isFetched: mailboxesFetched } = useMailboxes();
+	const { data: mailboxes = [], isFetched: mailboxesFetched } = useMailboxes();
 	const createMailbox = useCreateMailbox();
 	const deleteMailbox = useDeleteMailbox();
 
@@ -42,9 +42,12 @@ export default function HomeRoute() {
 
 	const domains = configData?.domains ?? [];
 	const emailAddresses = configData?.emailAddresses ?? [];
+	const activeEmails = new Set(mailboxes.map((mailbox) => mailbox.email.toLowerCase()));
+	const availableAddresses = emailAddresses.filter((address) => !activeEmails.has(address.toLowerCase()));
 
 	const [isCreateOpen, setIsCreateOpen] = useState(false);
 	const [newPrefix, setNewPrefix] = useState("");
+	const [selectedAddress, setSelectedAddress] = useState("");
 	const [selectedDomain, setSelectedDomain] = useState("");
 	const [newName, setNewName] = useState("");
 	const [isCreating, setIsCreating] = useState(false);
@@ -56,54 +59,31 @@ export default function HomeRoute() {
 	} | null>(null);
 	const [isDeleting, setIsDeleting] = useState(false);
 
-	// Set default domain when config loads
+	// Set defaults from the addresses the operator has already configured.
 	useEffect(() => {
-		if (domains.length > 0 && !selectedDomain) {
-			setSelectedDomain(domains[0]);
+		if (domains.length > 0 && !selectedDomain) setSelectedDomain(domains[0]);
+		if (!availableAddresses.some((address) => address.toLowerCase() === selectedAddress.toLowerCase())) {
+			setSelectedAddress(availableAddresses[0] ?? "");
 		}
-	}, [domains, selectedDomain]);
-
-	// Auto-create mailboxes from config (run once when both data sources are ready)
-	const autoCreateDone = useRef(false);
-	useEffect(() => {
-		if (autoCreateDone.current) return;
-		if (emailAddresses.length === 0 || !mailboxesFetched) return;
-		const existingEmails = new Set(
-			mailboxes.map((m) => m.email.toLowerCase()),
-		);
-		const toCreate = emailAddresses.filter(
-			(addr) => !existingEmails.has(addr.toLowerCase()),
-		);
-		if (toCreate.length === 0) {
-			autoCreateDone.current = true;
-			return;
-		}
-		autoCreateDone.current = true;
-		let cancelled = false;
-		Promise.all(
-			toCreate.map((addr) => {
-				const localPart = addr.split("@")[0] || addr;
-				return api.createMailbox(addr, localPart).catch(() => {});
-			}),
-		).then(() => { if (!cancelled) refetchMailboxes(); });
-		return () => { cancelled = true; };
-	}, [emailAddresses, mailboxes, refetchMailboxes]);
+	}, [availableAddresses, domains, selectedAddress, selectedDomain]);
 
 	const handleCreate = async (e: FormEvent) => {
 		e.preventDefault();
 		setCreateError(null);
-		if (!newPrefix || !selectedDomain) {
-			setCreateError("Please fill in all fields");
+		const email = isConfigured ? selectedAddress : `${newPrefix}@${selectedDomain}`;
+		if (isConfigured ? !availableAddresses.includes(selectedAddress) : !newPrefix || !selectedDomain) {
+			setCreateError(isConfigured ? "No additional pre-provisioned addresses are available." : "Please fill in all fields");
 			return;
 		}
-		const email = `${newPrefix}@${selectedDomain}`;
-		const name = newName || newPrefix;
+		const localPart = email.split("@")[0] || email;
+		const name = newName.trim() || localPart;
 		setIsCreating(true);
 		try {
 			await createMailbox.mutateAsync({ email, name });
-			toastManager.add({ title: "Mailbox created successfully!" });
+			toastManager.add({ title: isConfigured ? "Mailbox added" : "Mailbox created successfully!" });
 			setIsCreateOpen(false);
 			setNewPrefix("");
+			setSelectedAddress("");
 			setNewName("");
 		} catch (err: unknown) {
 			const message = (err instanceof Error ? err.message : null) || "Failed to create mailbox";
@@ -129,15 +109,9 @@ export default function HomeRoute() {
 	};
 
 	const isConfigured = emailAddresses.length > 0;
-	const accounts = isConfigured
-		? emailAddresses.map((addr) => ({
-				id: addr,
-				email: addr,
-				name: addr.split("@")[0] || addr,
-			}))
-		: mailboxes;
+	const accounts = mailboxes;
 
-	const isLoading = !configData;
+	const isLoading = !configData || !mailboxesFetched;
 
 	return (
 		<div className="min-h-screen bg-kumo-recessed">
@@ -145,13 +119,16 @@ export default function HomeRoute() {
 				<div className="mb-8">
 					<div className="flex items-center justify-between">
 						<h1 className="text-2xl font-bold text-kumo-default">Mailboxes</h1>
-						{!isConfigured && (
+						{domains.length > 0 && (
 							<Button
 								variant="primary"
 								icon={<PlusIcon size={16} />}
-								onClick={() => setIsCreateOpen(true)}
+								onClick={() => {
+									setCreateError(null);
+									setIsCreateOpen(true);
+								}}
 							>
-								New Mailbox
+								Add mailbox
 							</Button>
 						)}
 					</div>
@@ -223,16 +200,19 @@ export default function HomeRoute() {
 							</h3>
 							<p className="text-sm text-kumo-subtle max-w-sm mb-5">
 								{isConfigured
-									? "Your email routing is configured but no mailboxes have been created yet. They will appear here automatically."
+									? "No mailbox is linked yet. Use Add mailbox to link an operator-provisioned address."
 									: "Create a mailbox to start sending and receiving emails with your domain."}
 							</p>
-							{!isConfigured && (
+							{domains.length > 0 && (
 								<Button
 									variant="primary"
 									icon={<PlusIcon size={16} />}
-									onClick={() => setIsCreateOpen(true)}
+									onClick={() => {
+										setCreateError(null);
+										setIsCreateOpen(true);
+									}}
 								>
-									Create Mailbox
+									Add mailbox
 								</Button>
 							)}
 						</div>
@@ -244,7 +224,7 @@ export default function HomeRoute() {
 			<Dialog.Root open={isCreateOpen} onOpenChange={setIsCreateOpen}>
 				<Dialog size="sm" className="p-6">
 					<Dialog.Title className="text-base font-semibold mb-5">
-						Create New Mailbox
+						{isConfigured ? "Add Mailbox" : "Create New Mailbox"}
 					</Dialog.Title>
 					<form onSubmit={handleCreate} className="space-y-4">
 						{createError && (
@@ -252,45 +232,62 @@ export default function HomeRoute() {
 								{createError}
 							</Text>
 						)}
-						<div>
-							<span className="text-sm font-medium text-kumo-default mb-1.5 block">
-								Email Address
-							</span>
-							<div className="flex items-center gap-2">
-								<div className="flex-1">
-									<Input
-										aria-label="Address prefix"
-										placeholder="info"
-										size="sm"
-										value={newPrefix}
-										onChange={(e) => setNewPrefix(e.target.value)}
-										required
-									/>
-								</div>
-								<span className="text-sm text-kumo-subtle">@</span>
-								{domains.length > 1 ? (
-									<div className="flex-1">
-							<Select
-								aria-label="Domain"
-								value={selectedDomain}
-								onValueChange={(value) => {
-									if (value) setSelectedDomain(value);
-								}}
-							>
-											{domains.map((d) => (
-												<Select.Option key={d} value={d}>
-													{d}
-												</Select.Option>
-											))}
-										</Select>
-									</div>
+						{isConfigured ? (
+							<div>
+								<span className="text-sm font-medium text-kumo-default mb-1.5 block">Mailbox address</span>
+								{availableAddresses.length > 0 ? (
+									<>
+										<Select
+										aria-label="Pre-provisioned address"
+										value={selectedAddress}
+										onValueChange={(value) => { if (value) setSelectedAddress(value); }}
+									>
+										{availableAddresses.map((address) => (
+											<Select.Option key={address} value={address}>{address}</Select.Option>
+										))}
+									</Select>
+									<p className="mt-2 text-xs text-kumo-subtle">This links an existing Stalwart mailbox; it does not create a server account.</p>
+									</>
 								) : (
-									<span className="text-sm text-kumo-subtle">
-										{selectedDomain || "no domain"}
-									</span>
+									<div className="rounded-md bg-kumo-fill px-3 py-2 text-sm text-kumo-subtle">
+										<p>No additional configured addresses are available.</p>
+										<p className="mt-1">An operator must configure the address and its separate Stalwart account first.</p>
+									</div>
 								)}
 							</div>
-						</div>
+						) : (
+							<div>
+								<span className="text-sm font-medium text-kumo-default mb-1.5 block">Email Address</span>
+								<div className="flex items-center gap-2">
+									<div className="flex-1">
+										<Input
+											aria-label="Address prefix"
+											placeholder="info"
+											size="sm"
+											value={newPrefix}
+											onChange={(e) => setNewPrefix(e.target.value)}
+											required
+										/>
+									</div>
+									<span className="text-sm text-kumo-subtle">@</span>
+									{domains.length > 1 ? (
+										<div className="flex-1">
+											<Select
+											aria-label="Domain"
+											value={selectedDomain}
+											onValueChange={(value) => { if (value) setSelectedDomain(value); }}
+										>
+											{domains.map((domain) => (
+												<Select.Option key={domain} value={domain}>{domain}</Select.Option>
+											))}
+										</Select>
+										</div>
+									) : (
+										<span className="text-sm text-kumo-subtle">{selectedDomain || "no domain"}</span>
+									)}
+								</div>
+							</div>
+						)}
 						<Input
 							label="Display Name (optional)"
 							placeholder="Info"
@@ -311,9 +308,9 @@ export default function HomeRoute() {
 								variant="primary"
 								size="sm"
 								loading={isCreating}
-								disabled={!selectedDomain}
+								disabled={isConfigured ? !availableAddresses.includes(selectedAddress) : !newPrefix || !selectedDomain}
 							>
-								Create
+								{isConfigured ? "Add" : "Create"}
 							</Button>
 						</div>
 					</form>

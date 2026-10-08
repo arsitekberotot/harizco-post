@@ -18,6 +18,7 @@ import type { AppConfig } from "./config";
 import type { AccessTestOptions } from "./auth/access";
 import { applyPrivateHeaders, createRequestGate } from "./auth/request";
 import type { MailBackend, ConfiguredAddresses, FlagInput } from "./mail/backend";
+import type { MailboxRegistry } from "./mailboxes/registry";
 import { SubmissionValidationError } from "./mail/validation";
 import { buildForwardSendInput, buildReplySendInput } from "./routes/reply-forward";
 import type { StatusReport } from "./routes/status";
@@ -52,6 +53,10 @@ export interface CreateAppOptions {
 	mailStore?: MailStore;
 	/** Real mail backend (Phase 2+). */
 	backend?: MailBackend;
+	/** Account-isolated backends keyed by canonical configured email address. */
+	mailboxBackends?: ReadonlyMap<string, MailBackend>;
+	/** Registry only toggles pre-provisioned mailbox bindings; it cannot create Stalwart accounts. */
+	mailboxRegistry?: MailboxRegistry;
 	/** Operator-provisioned address map returned by GET /api/v1/config. */
 	addresses?: ConfiguredAddresses;
 	/** Sync/import status source for GET /api/v1/status (content-free). */
@@ -155,13 +160,20 @@ export function createApp(options: CreateAppOptions): Hono {
 			}
 		}
 
-		// No real backend is wired yet: keep the honest 503 (Phase 1 contract),
-		// even when a probe is present. A probe is not a mailbox.
-		if (!backend) {
+		// A real backend or a non-empty map of account-scoped backends is required.
+		if (!backend && (options.mailboxBackends?.size ?? 0) === 0) {
 			return jsonError(503, "Mailbox backend is not available yet");
 		}
 
-		return handlePrivateRoute(c, path, method, backend, options.addresses);
+		return handlePrivateRoute(
+			c,
+			path,
+			method,
+			backend,
+			options.addresses,
+			options.mailboxBackends,
+			options.mailboxRegistry,
+		);
 	});
 
 	// --- Unknown /api routes: JSON 404, never SPA HTML ---------------------
@@ -189,8 +201,10 @@ async function handlePrivateRoute(
 	c: Context,
 	path: string,
 	method: string,
-	backend: MailBackend,
+	defaultBackend: MailBackend | undefined,
 	addresses: ConfiguredAddresses | undefined,
+	mailboxBackends?: ReadonlyMap<string, MailBackend>,
+	mailboxRegistry?: MailboxRegistry,
 ): Promise<Response> {
 	try {
 		if (method === "GET" && path === "/api/v1/config") {
@@ -198,12 +212,82 @@ async function handlePrivateRoute(
 		}
 
 		if (method === "GET" && path === "/api/v1/mailboxes") {
-			return jsonOk(await backend.listMailboxes());
+			if (mailboxBackends) {
+				const configured = addresses?.emailAddresses ?? [...mailboxBackends.keys()];
+				const summaries = configured.flatMap((rawAddress) => {
+					const email = rawAddress.trim().toLowerCase();
+					if (!mailboxBackends.has(email)) return [];
+					const record = mailboxRegistry?.getByAddress(email);
+					if (mailboxRegistry && record?.enabled !== 1) return [];
+					return [{
+						id: email,
+						email,
+						name: record?.display_name.trim() || email.split("@")[0] || email,
+					}];
+				});
+				return jsonOk(summaries);
+			}
+			if (!defaultBackend) return jsonError(503, "Mailbox backend is not available yet");
+			return jsonOk(await defaultBackend.listMailboxes());
 		}
+
+		if (method === "POST" && path === "/api/v1/mailboxes") {
+			if (!mailboxRegistry || !mailboxBackends) return jsonError(503, "Mailbox registry is not available");
+			const body = await readJson(c);
+			if (!body) return jsonError(400, "Invalid JSON body");
+			const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+			if (!email) return jsonError(400, "email is required");
+			const configured = addresses?.emailAddresses.some((candidate) => candidate.trim().toLowerCase() === email) ?? false;
+			if (!configured || !mailboxBackends.has(email)) return jsonError(404, "Mailbox is not configured");
+			const existing = mailboxRegistry.getByAddress(email);
+			if (!existing?.jmap_account_id) return jsonError(404, "Mailbox has no pre-provisioned JMAP account");
+			if (typeof body.name === "string" && body.name.trim()) {
+				const name = body.name.trim();
+				if (name.length > 120 || /[\x00-\x1f\x7f]/.test(name)) return jsonError(400, "Invalid mailbox name");
+				mailboxRegistry.setDisplayName(existing.id, name);
+			}
+			const activated = mailboxRegistry.activateByAddress(email);
+			return jsonOk({ id: email, email, name: activated.display_name.trim() || email.split("@")[0] || email });
+		}
+
+		const deleteMatch = /^\/api\/v1\/mailboxes\/([^/]+)$/.exec(path);
+		if (method === "DELETE" && deleteMatch) {
+			if (!mailboxRegistry || !mailboxBackends) return jsonError(503, "Mailbox registry is not available");
+			const email = decodeURIComponent(deleteMatch[1]).trim().toLowerCase();
+			const configured = addresses?.emailAddresses.some((candidate) => candidate.trim().toLowerCase() === email) ?? false;
+			const record = mailboxRegistry.getByAddress(email);
+			if (!configured || !mailboxBackends.has(email) || !record || record.enabled !== 1) {
+				return jsonError(404, "Mailbox not found");
+			}
+			mailboxRegistry.unlink(record.id);
+			const headers = new Headers();
+			applyPrivateHeaders(headers);
+			return new Response(null, { status: 204, headers });
+		}
+
+		const isAccountScoped = mailboxBackends !== undefined;
+		const mailboxMatch = /^\/api\/v1\/mailboxes\/([^/]+)/.exec(path);
+		const accountAddress = mailboxMatch ? decodeURIComponent(mailboxMatch[1]).trim().toLowerCase() : null;
+		if (isAccountScoped && accountAddress) {
+			const record = mailboxRegistry?.getByAddress(accountAddress);
+			if (!mailboxBackends.has(accountAddress) || (mailboxRegistry && record?.enabled !== 1)) {
+				return jsonError(404, "Not found");
+			}
+		}
+		const backend = isAccountScoped && accountAddress
+			? mailboxBackends.get(accountAddress)
+			: defaultBackend;
+
+		if (!backend) return jsonError(503, "Mailbox backend is not available yet");
 
 		let m = /^\/api\/v1\/mailboxes\/([^/]+)$/.exec(path);
 		if (m && method === "GET") {
-			const mailbox = await backend.getMailbox(decodeURIComponent(m[1]));
+			const id = decodeURIComponent(m[1]);
+			if (isAccountScoped) {
+				const email = id.trim().toLowerCase();
+				return jsonOk({ id: email, email, name: email.split("@")[0] ?? email });
+			}
+			const mailbox = await backend.getMailbox(id);
 			if (!mailbox) return jsonError(404, "Not found");
 			return jsonOk(mailbox);
 		}
@@ -214,7 +298,10 @@ async function handlePrivateRoute(
 			const url = new URL(c.req.url);
 			const limit = clampInt(url.searchParams.get("limit"), 50, 1, 200);
 			const offset = clampInt(url.searchParams.get("offset"), 0, 0, 100000);
-			return jsonOk(await backend.listEmails(mailboxId, { limit, offset }));
+			const requestedFolder = isAccountScoped ? (url.searchParams.get("folder") ?? "inbox") : mailboxId;
+			const folderId = isAccountScoped ? await resolveFolderId(backend, requestedFolder) : requestedFolder;
+			if (!folderId) return jsonError(404, "Folder not found");
+			return jsonOk(await backend.listEmails(folderId, { limit, offset }));
 		}
 		if (m && method === "POST") {
 			// The browser's `sendEmail` posts here. Validation and idempotency
@@ -258,10 +345,12 @@ async function handlePrivateRoute(
 			if (!body) return jsonError(400, "Invalid JSON body");
 			if (typeof body.body !== "string") return jsonError(400, "body is required");
 			const original = await backend.getEmail(emailId);
-			if (!original || !original.mailboxIds.includes(mailboxId)) {
+			if (!original || (!isAccountScoped && !original.mailboxIds.includes(mailboxId))) {
 				return jsonError(404, "Email not found");
 			}
-			const from = typeof body.from === "string" && body.from ? body.from : (addresses?.emailAddresses[0] ?? "");
+			const from = typeof body.from === "string" && body.from
+				? body.from
+				: (isAccountScoped ? accountAddress : addresses?.emailAddresses[0]) ?? "";
 			if (!from) return jsonError(400, "from is required");
 			try {
 				const input =
@@ -290,9 +379,18 @@ async function handlePrivateRoute(
 			const emailId = decodeURIComponent(m[2]);
 			const body = await readJson(c);
 			if (!body) return jsonError(400, "Invalid JSON body");
-			const to = typeof body.mailboxId === "string" ? body.mailboxId : null;
-			if (!to) return jsonError(400, "mailboxId is required");
-			const result = await backend.move([emailId], mailboxId, to);
+			const to = typeof body.folderId === "string"
+				? body.folderId
+				: typeof body.mailboxId === "string" ? body.mailboxId : null;
+			if (!to) return jsonError(400, "folderId is required");
+			let from = mailboxId;
+			if (isAccountScoped) {
+				const email = await backend.getEmail(emailId);
+				if (!email) return jsonError(404, "Email not found");
+				from = typeof body.fromMailboxId === "string" ? body.fromMailboxId : (email.mailboxIds[0] ?? "");
+				if (!from) return jsonError(400, "fromMailboxId is required");
+			}
+			const result = await backend.move([emailId], from, to);
 			return jsonOk(result);
 		}
 
@@ -302,7 +400,7 @@ async function handlePrivateRoute(
 			const emailId = decodeURIComponent(m[2]);
 			if (method === "GET") {
 				const email = await backend.getEmail(emailId);
-				if (!email || !email.mailboxIds.includes(mailboxId)) {
+				if (!email || (!isAccountScoped && !email.mailboxIds.includes(mailboxId))) {
 					return jsonError(404, "Not found");
 				}
 				return jsonOk(email);
@@ -363,10 +461,13 @@ async function handlePrivateRoute(
 
 		m = /^\/api\/v1\/mailboxes\/([^/]+)\/drafts$/.exec(path);
 		if (m && method === "POST") {
-			const mailboxId = decodeURIComponent(m[1]);
 			const body = await readJson(c);
 			if (!body) return jsonError(400, "Invalid JSON body");
 			if (typeof body.body !== "string") return jsonError(400, "body is required");
+			const mailboxId = isAccountScoped
+				? await resolveFolderId(backend, "drafts")
+				: decodeURIComponent(m[1]);
+			if (!mailboxId) return jsonError(404, "Drafts folder not found");
 			const draft = await backend.createDraft({
 				mailboxId,
 				to: asStringArray(body.to),
@@ -394,15 +495,20 @@ async function handlePrivateRoute(
 		if (m && (method === "GET" || method === "POST")) {
 			const mailboxId = decodeURIComponent(m[1]);
 			let filter: Record<string, unknown> = {};
+			let requestedFolder = "inbox";
 			if (method === "GET") {
 				const url = new URL(c.req.url);
 				const q = url.searchParams.get("q");
+				requestedFolder = url.searchParams.get("folder") ?? "inbox";
 				if (q) filter = { text: q };
 			} else {
 				const body = await readJson(c);
 				filter = body && typeof body === "object" ? body : {};
+				if (typeof filter.folder === "string") requestedFolder = filter.folder;
 			}
-			return jsonOk(await backend.search(mailboxId, filter));
+			const folderId = isAccountScoped ? await resolveFolderId(backend, requestedFolder) : mailboxId;
+			if (!folderId) return jsonError(404, "Folder not found");
+			return jsonOk(await backend.search(folderId, filter));
 		}
 
 		return jsonError(404, "Not found");
@@ -414,6 +520,15 @@ async function handlePrivateRoute(
 		// in a later phase without changing the wire contract.
 		void detail;
 	}
+}
+
+async function resolveFolderId(backend: MailBackend, requested: string): Promise<string | null> {
+	const folders = await backend.listMailboxes();
+	const direct = folders.find((folder) => folder.id === requested);
+	if (direct) return direct.id;
+	const normalized = requested.trim().toLowerCase();
+	const role = normalized === "draft" ? "drafts" : normalized;
+	return folders.find((folder) => folder.systemRole?.toLowerCase() === role)?.id ?? null;
 }
 
 function clampInt(raw: string | null, fallback: number, min: number, max: number): number {

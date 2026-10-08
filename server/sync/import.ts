@@ -51,7 +51,10 @@ export interface ImportPipelineOptions {
 	db: Journal;
 	router: RecipientRouter;
 	spool: SpoolPort;
-	jmap: JmapImportPort;
+	/** Shared account adapter for single-mailbox deployments. */
+	jmap?: JmapImportPort;
+	/** Selects an isolated JMAP adapter for each local mailbox identity. */
+	jmapForMailbox?: (mailboxId: string) => JmapImportPort;
 	/** Resolves the JMAP account for a given local mailbox row. */
 	mailboxIdResolver: (mailboxId: string) => string;
 	/** Test-only hook to force failures at named boundaries. */
@@ -68,7 +71,7 @@ export class ImportPipeline {
 	readonly #db: Journal;
 	readonly #router: RecipientRouter;
 	readonly #spool: SpoolPort;
-	readonly #jmap: JmapImportPort;
+	readonly #jmapForMailbox: (mailboxId: string) => JmapImportPort;
 	readonly #resolveAccount: (mailboxId: string) => string;
 	readonly #fault: (point: ImportFaultPoint) => void;
 	readonly #shouldFailTarget: (mailboxId: string) => boolean;
@@ -77,7 +80,10 @@ export class ImportPipeline {
 		this.#db = opts.db;
 		this.#router = opts.router;
 		this.#spool = opts.spool;
-		this.#jmap = opts.jmap;
+		const sharedJmap = opts.jmap;
+		const jmapForMailbox = opts.jmapForMailbox ?? (sharedJmap ? () => sharedJmap : undefined);
+		if (!jmapForMailbox) throw new Error("ImportPipeline requires a JMAP port or mailbox-scoped JMAP ports.");
+		this.#jmapForMailbox = jmapForMailbox;
 		this.#resolveAccount = opts.mailboxIdResolver;
 		this.#fault = opts.faultInjector ?? (() => {});
 		this.#shouldFailTarget = opts.shouldFailTarget ?? (() => false);
@@ -191,13 +197,16 @@ export class ImportPipeline {
 		bytes: Uint8Array,
 	): Promise<{ state: "verified"; stalwartEmailId: string }> {
 		const job = this.#readJob(jobId);
+		const jmap = this.#jmapForMailbox(mailboxId);
+		const accountId = this.#resolveAccount(mailboxId);
+		if (!accountId) throw new Error(`No JMAP account bound for mailbox ${mailboxId}.`);
 
 		// Reconciliation first: if a previous attempt already delivered this
 		// content, adopt it rather than creating a second copy.
 		if (job.state === "uploaded" || job.state === "imported" || job.state === "failed") {
-			const existing = await this.#jmap.findByContentHash(hashBytes(bytes));
+			const existing = await jmap.findByContentHash(hashBytes(bytes));
 			if (existing) {
-				const rb = await this.#jmap.readback(existing.emailId);
+				const rb = await jmap.readback(existing.emailId);
 				if (rb && rb.blobId === existing.blobId) {
 					this.#updateJob(jobId, {
 						state: "verified",
@@ -216,15 +225,12 @@ export class ImportPipeline {
 
 		this.#fault("before_upload");
 
-		const accountId = this.#resolveAccount(mailboxId);
-		if (!accountId) throw new Error(`No JMAP account bound for mailbox ${mailboxId}.`);
-
-		const blobId = await this.#jmap.upload(bytes);
+		const blobId = await jmap.upload(bytes);
 		this.#updateJob(jobId, { state: "uploaded", blobId });
 
 		this.#fault("after_upload");
 
-		const { emailId } = await this.#jmap.importEmail({ mailboxId: accountId, blobId, bytes });
+		const { emailId } = await jmap.importEmail({ mailboxId: accountId, blobId, bytes });
 		this.#updateJob(jobId, { state: "imported", emailId, blobId });
 
 		// The email id is committed to the journal BEFORE the post-import fault
@@ -234,7 +240,7 @@ export class ImportPipeline {
 		this.#fault("after_import");
 
 		// Authoritative readback: the message must exist with the exact blob.
-		const rb = await this.#jmap.readback(emailId);
+		const rb = await jmap.readback(emailId);
 		if (!rb || rb.blobId !== blobId || rb.size !== bytes.byteLength) {
 			throw new Error(
 				`Readback mismatch for job ${jobId}: expected blob ${blobId} (${bytes.byteLength} bytes), got ${rb ? `${rb.blobId} (${rb.size} bytes)` : "nothing"}.`,

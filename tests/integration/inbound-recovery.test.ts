@@ -136,6 +136,40 @@ describe("happy path", () => {
 		// Temporary spool is released only after verification.
 		expect(h.spool.released).toHaveLength(1);
 	});
+
+	test("imports each recipient only through that mailbox's JMAP account", async () => {
+		const db = openJournal(":memory:");
+		const registry = new MailboxRegistry(db);
+		registry.provision({ id: "mb-hanif", address: "hanif@atelieriza.com" });
+		registry.bindAccount("mb-hanif", "acct-hanif");
+		registry.setEnabled("mb-hanif", true);
+		registry.provision({ id: "mb-natla", address: "natla@atelieriza.com" });
+		registry.bindAccount("mb-natla", "acct-natla");
+		registry.setEnabled("mb-natla", true);
+		const router = new RecipientRouter({ db, registry });
+		const spool = new FakeSpool();
+		const hanifJmap = new FakeJmap();
+		const natlaJmap = new FakeJmap();
+		const adapters = new Map([["mb-hanif", hanifJmap], ["mb-natla", natlaJmap]]);
+		const pipeline = new ImportPipeline({
+			db,
+			router,
+			spool,
+			jmap: hanifJmap,
+			jmapForMailbox: (mailboxId: string) => adapters.get(mailboxId)!,
+			mailboxIdResolver: (mailboxId: string) => registry.getById(mailboxId)?.jmap_account_id ?? "",
+		});
+
+		const result = await pipeline.importReceipt({
+			provider: "resend",
+			receiptId: "multi-recipient",
+			recipients: ["hanif@atelieriza.com", "natla@atelieriza.com"],
+			bytes: MIME,
+		});
+		expect(result.status).toBe("imported");
+		expect(hanifJmap.imported.map((entry) => entry.mailboxId)).toEqual(["acct-hanif"]);
+		expect(natlaJmap.imported.map((entry) => entry.mailboxId)).toEqual(["acct-natla"]);
+	});
 });
 
 describe("fault injection", () => {
