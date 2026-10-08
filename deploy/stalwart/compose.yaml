@@ -1,0 +1,47 @@
+# Harizco Post: local Stalwart mailbox store (Docker Compose)
+#
+# Pinned to the same release the Task 5 fixtures use (v0.16.25), so the
+# production store and the tested primitives are the same version.
+#
+# Exposure rules (from the plan, line 124): this store is for the local app
+# only. EVERY published port binds 127.0.0.1 — mail.atelieriza.com must reach
+# the UI + its API, never Stalwart's WebUI, JMAP, database, or SMTP. Widening a
+# bind to 0.0.0.0 here would bypass the Cloudflare Access gate.
+#
+# The bootstrap/admin secret comes from .env (gitignored); it is never baked
+# into this file. Absent that file, Compose fails rather than starting with a
+# guessable credential.
+
+services:
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16.25
+    container_name: harizco-stalwart
+    restart: unless-stopped
+    # Recovery/bootstrap mode lets the first boot accept the generated admin
+    # credential; the management JMAP API then performs the real configuration.
+    environment:
+      STALWART_RECOVERY_MODE: "true"
+      STALWART_RECOVERY_ADMIN: "${STALWART_RECOVERY_ADMIN:?set STALWART_RECOVERY_ADMIN in .env}"
+      # Advertise the loopback origin so discovered session URLs never leak a
+      # host-derived HTTPS URL the local client cannot reach.
+      STALWART_PUBLIC_URL: "http://127.0.0.1:8080"
+    ports:
+      # Loopback-only. Do not change these to 0.0.0.0.
+      - "127.0.0.1:8080:8080"   # HTTP + JMAP (management and normal)
+    volumes:
+      - stalwart-data:/opt/stalwart
+    healthcheck:
+      # HTTP readiness: bootstrap mode answers 302 on the management port, so a
+      # 2xx/3xx means the listener is up. Any connection failure exits non-zero.
+      # The image ships curl but not wget. Any HTTP response (bootstrap mode
+      # answers 302) proves the management listener is up; curl exits non-zero
+      # only on a transport failure, which is exactly the unhealthy case.
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  stalwart-data:
+    name: harizco-stalwart-data
