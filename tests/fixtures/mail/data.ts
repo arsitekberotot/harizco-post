@@ -71,6 +71,42 @@ export const fixtureEmails: Email[] = [
 		participants: "notes@example.invalid, owner@harizco-post.invalid",
 		attachments: [],
 	},
+	{
+		id: "fixture-email-3",
+		thread_id: "fixture-thread-3",
+		folder_id: "inbox",
+		subject: "Synthetic image and attachment message",
+		sender: "designer@example.invalid",
+		recipient: "owner@harizco-post.invalid",
+		date: "2026-10-07T12:45:00.000Z",
+		read: true,
+		starred: false,
+		// Synthetic metadata only: no fixture attachment byte/download endpoint.
+		// Tracker must be blocked; the intentionally non-raster CID must stay
+		// unresolved (only authorized, bounded raster data may render inline).
+		body: `<p>${FIXTURE_LABEL}</p><p>Inline logo: <img src="cid:fixture-logo" alt="logo"></p><p>Remote pixel: <img src="https://tracker.example.invalid/pixel.gif" alt="pixel"></p>`,
+		snippet: "Synthetic message with an inline image and a remote tracker.",
+		thread_count: 1,
+		thread_unread_count: 0,
+		participants: "designer@example.invalid, owner@harizco-post.invalid",
+		attachments: [
+			{
+				id: "fixture-attachment-1",
+				filename: "layout-preview.txt",
+				mimetype: "text/plain",
+				size: 42,
+				content_id: "fixture-logo",
+				disposition: "inline",
+			},
+			{
+				id: "fixture-attachment-2",
+				filename: "spec.txt",
+				mimetype: "text/plain",
+				size: 128,
+				disposition: "attachment",
+			},
+		],
+	},
 ];
 
 export function listFixtureMailboxes(): Mailbox[] {

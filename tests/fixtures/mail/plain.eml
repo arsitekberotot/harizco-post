@@ -1,0 +1,9 @@
+From: Fixture Sender <sender@example.test>
+To: Fixture User <fixture@harizco.test>
+Subject: Harizco fixture plain
+Message-ID: <fixture-plain@harizco.test>
+Date: Wed, 07 Oct 2026 12:00:00 +0700
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hello from the Harizco Post isolated fixture.

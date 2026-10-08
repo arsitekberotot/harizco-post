@@ -13,6 +13,8 @@
 import { JmapClient, JmapError, type JmapClientOptions, type MethodCall } from "./jmap-client";
 import { DraftStore, type DraftJmapPort } from "./drafts";
 import { validateFolderMutation } from "./folders";
+import { validateSubmission, type SenderPolicy } from "./validation";
+import { submitWithIdempotency, type RelayTransport, type SubmissionStore } from "./submissions";
 import type {
 	DraftInput,
 	EmailListResult,
@@ -22,14 +24,31 @@ import type {
 	MailBackend,
 	MailboxView,
 	SearchResult,
+	SendInput,
+	SendResult,
 } from "./backend";
+
+/**
+ * Optional submission wiring.
+ *
+ * The web process holds no relay credential: it validates, records the durable
+ * intent, and hands the payload to the relay port (which the worker owns). With
+ * no wiring, `sendEmail` refuses rather than pretending a message was sent.
+ */
+export interface SubmissionOptions {
+	store: SubmissionStore;
+	transport: RelayTransport;
+	policy: SenderPolicy;
+}
 
 export class JmapMailBackend implements MailBackend {
 	readonly #client: JmapClient;
 	readonly #drafts: DraftStore;
+	readonly #submission?: SubmissionOptions;
 
-	constructor(options: JmapClientOptions) {
+	constructor(options: JmapClientOptions & { submission?: SubmissionOptions }) {
 		this.#client = new JmapClient(options);
+		this.#submission = options.submission;
 		const port: DraftJmapPort = {
 			createDraft: (mailboxId, payload) => this.#createDraft(mailboxId, payload),
 			destroyDraft: (id) => this.#destroyDraft(id),
@@ -215,5 +234,47 @@ export class JmapMailBackend implements MailBackend {
 			["Email/set", { accountId: session.accountId, destroy: [id] }, "c0"],
 		];
 		await this.#client.request(calls);
+	}
+
+	/**
+	 * Validate, then hand the payload to the idempotent submission path.
+	 *
+	 * Validation runs BEFORE the durable intent is written, so a rejected
+	 * message leaves no row and no provider attempt. Without submission wiring
+	 * the call refuses (an honest failure) instead of claiming delivery.
+	 */
+	async sendEmail(input: SendInput): Promise<SendResult> {
+		const submission = this.#submission;
+		if (!submission) {
+			throw new JmapError("submission_unconfigured", "No outbound submission transport is configured.");
+		}
+		// The guard is authoritative: it normalizes recipients and rejects
+		// spoofed From, injection, cross-mailbox attachments and auto-send.
+		const checked = validateSubmission(
+			{
+				mailboxId: input.mailboxId,
+				from: input.from,
+				to: input.to,
+				cc: input.cc ?? [],
+				bcc: input.bcc ?? [],
+				subject: input.subject ?? "",
+				body: input.body,
+				attachments: input.attachments ?? [],
+			},
+			submission.policy,
+		);
+		const result = await submitWithIdempotency(submission.store, submission.transport, {
+			mailboxId: input.mailboxId,
+			from: input.from,
+			to: checked.to,
+			cc: checked.cc,
+			bcc: checked.bcc,
+			subject: input.subject ?? "",
+			body: input.body,
+			...(input.attachments?.length ? { attachments: input.attachments } : {}),
+			...(input.inReplyTo ? { inReplyTo: input.inReplyTo } : {}),
+			...(input.references?.length ? { references: input.references } : {}),
+		});
+		return { requestId: result.requestId, state: result.state === "submitted" || result.state === "accepted" ? "queued" : result.state === "unknown" ? "unknown" : "failed" };
 	}
 }

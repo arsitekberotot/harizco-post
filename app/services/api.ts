@@ -23,6 +23,7 @@ async function request<T>(
 	options: RequestInit = {},
 ): Promise<T> {
 	const controller = new AbortController();
+	const method = options.method?.toUpperCase() ?? "GET";
 	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
 	// Combine caller signal (e.g. TanStack Query abort) with our timeout signal
@@ -33,10 +34,12 @@ async function request<T>(
 	try {
 		const res = await fetch(url, {
 			...options,
+			credentials: "same-origin",
 			signal,
 			headers: {
 				"Content-Type": "application/json",
 				...(options.headers as Record<string, string>),
+				...(method === "GET" || method === "HEAD" ? {} : { "X-Harizco-CSRF": "1" }),
 			},
 		});
 

@@ -13,6 +13,7 @@
 // id, and blob id are distinct identifiers. The RFC Message-ID is separate again.
 
 import type { EmailDto, MailboxDto } from "./mapping";
+import type { AttachmentRef } from "./validation";
 
 /** A configured, selectable mailbox as the UI sees it. */
 export type MailboxView = MailboxDto;
@@ -54,6 +55,32 @@ export interface FolderMutationInput {
 	parentId?: string | null;
 }
 
+/** A submission request as it arrives from the browser, before validation. */
+export interface SendInput {
+	mailboxId: string;
+	from: string;
+	to: string[];
+	cc?: string[];
+	bcc?: string[];
+	subject?: string;
+	body: string;
+	/** Caller-supplied stable id for retry/replay; the store derives one if absent. */
+	requestId?: string;
+	inReplyTo?: string | null;
+	references?: string[];
+	/**
+	 * Attachments to carry. Each is an owned blob reference; the submission
+	 * guard re-checks `mailboxId` so a cross-mailbox blob can never ride out.
+	 */
+	attachments?: AttachmentRef[];
+}
+
+/** Outcome of one submission attempt, with explicit ambiguity semantics. */
+export interface SendResult {
+	requestId: string;
+	state: "queued" | "failed" | "unknown";
+}
+
 /**
  * A mail backend. Every method is account-scoped by construction: the adapter
  * instance is already bound to one configured mailbox/account, so no method
@@ -70,6 +97,12 @@ export interface MailBackend {
 	setThreadRead(mailboxId: string, emailIds: string[], read: boolean): Promise<{ updated: string[] }>;
 	move(ids: string[], fromMailboxId: string, toMailboxId: string): Promise<{ updated: string[] }>;
 	createDraft(input: DraftInput): Promise<{ draftId: string }>;
+	/**
+	 * Submit a message for delivery. Implementations MUST run server-side
+	 * validation and idempotency before any provider side effect, and report
+	 * `unknown` on an ambiguous result rather than claiming success.
+	 */
+	sendEmail(input: SendInput): Promise<SendResult>;
 	createFolder(input: FolderMutationInput): Promise<{ id: string }>;
 	renameFolder(id: string, name: string): Promise<{ updated: string }>;
 	deleteFolder(id: string, moveToMailboxId: string): Promise<{ updated: string }>;

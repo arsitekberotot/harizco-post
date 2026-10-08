@@ -6,15 +6,15 @@
 --
 -- This schema records integration state only. It is not a mailbox store:
 -- Stalwart remains canonical for message content, folders, flags, and blobs.
--- The `UNIQUE (provider, provider_receipt_id, target_mailbox_id)` constraint is
--- what makes a replay of the same provider receipt produce one visible copy.
+-- The UNIQUE constraint deduplicates journal jobs per receipt/target. It does
+-- not make a cross-system JMAP import exactly-once; canonical readback is required.
 
 CREATE TABLE IF NOT EXISTS mailboxes (
   id              TEXT PRIMARY KEY,
   address         TEXT NOT NULL UNIQUE,
   display_name    TEXT NOT NULL DEFAULT '',
   jmap_account_id TEXT,
-  enabled         INTEGER NOT NULL DEFAULT 1,
+  enabled         INTEGER NOT NULL DEFAULT 0,
   created_at      TEXT NOT NULL
 );
 

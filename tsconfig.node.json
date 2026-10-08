@@ -7,7 +7,9 @@
     "playwright.config.ts",
     "tests/**/*",
     "server/**/*",
-    "app/types/**/*"
+    "shared/**/*",
+    "app/types/**/*",
+    "app/services/api.ts"
   ],
   "compilerOptions": {
     "composite": true,

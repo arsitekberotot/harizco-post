@@ -23,6 +23,9 @@ import { InboundPoller } from "./sync/poller";
 import { FsSpool } from "./sync/spool";
 import { JmapImportAdapter } from "./sync/jmap-import";
 import { ResendReceivingClient } from "./integrations/resend-receiving";
+import { createRelayHandler } from "./routes/relay";
+import { loadRelayBinding } from "./config";
+import { serve } from "@hono/node-server";
 
 const OWNER = "sync-worker";
 
@@ -76,6 +79,25 @@ async function main(): Promise<void> {
 		poll: poller.poll,
 	});
 
+	// Optional outbound relay listener. It owns the provider secret and binds
+	// loopback only, so the web process can queue a send without ever holding
+	// the credential. Absent a binding, no listener starts (sends stay refused).
+	const relayBinding = loadRelayBinding(process.env);
+	const relayServer = relayBinding
+		? serve(
+				{
+					hostname: relayBinding.host,
+					port: relayBinding.port,
+					overrideGlobalObjects: false,
+					fetch: createRelayHandler({
+						secret: relayBinding.secret,
+						relay: { apiKey: relayBinding.apiKey, baseUrl: relayBinding.baseUrl },
+					}),
+				},
+				(info) => console.log(`[harizco-relay] listening on http://${info.address}:${info.port}`),
+			)
+		: null;
+
 	if (!runner.acquireLease()) {
 		console.error(`[harizco-sync] another worker holds the lease; exiting.`);
 		process.exit(0);
@@ -87,6 +109,8 @@ async function main(): Promise<void> {
 		stopping = true;
 		console.log(`[harizco-sync] received ${signal}; stopping after the current poll.`);
 		runner.stop();
+		// Stop accepting sends as soon as shutdown begins.
+		relayServer?.close();
 	};
 
 	process.on("SIGTERM", () => shutdown("SIGTERM"));

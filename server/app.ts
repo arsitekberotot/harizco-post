@@ -5,9 +5,8 @@
 // Harizco Post: local Hono application composition.
 //
 // This composes the API surface served by the loopback Node runtime. The
-// production path is fail-closed: until Cloudflare Access JWT verification
-// lands (Phase 5) every private request is denied, and header presence alone is
-// never treated as identity.
+// Access signatures and owner identity are verified before private routing.
+// The same middleware guards the production SPA/static boundary.
 //
 // Mail is reached only through the MailBackend port (server/mail/backend.ts).
 // When no backend is configured, authenticated private reads return an honest
@@ -16,12 +15,16 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { AppConfig } from "./config";
+import type { AccessTestOptions } from "./auth/access";
+import { applyPrivateHeaders, createRequestGate } from "./auth/request";
 import type { MailBackend, ConfiguredAddresses, FlagInput } from "./mail/backend";
+import { SubmissionValidationError } from "./mail/validation";
+import { buildForwardSendInput, buildReplySendInput } from "./routes/reply-forward";
 import type { StatusReport } from "./routes/status";
 
 /** Authentication strategies supported by the composition root. */
 export type AuthMode =
-	/** Production-style Cloudflare Access path. Denies until JWT checks land. */
+	/** Production Cloudflare Access signature and owner verification. */
 	| "access"
 	/** Explicit test-only seam. Never reachable from production env alone. */
 	| "fixture";
@@ -43,6 +46,8 @@ export interface MailStore {
 export interface CreateAppOptions {
 	config: AppConfig;
 	authMode?: AuthMode;
+	/** Explicit synthetic transport, rejected outside NODE_ENV=test composition. */
+	accessTestOptions?: AccessTestOptions;
 	/** Legacy probe seam (Phase 1 runtime contracts). */
 	mailStore?: MailStore;
 	/** Real mail backend (Phase 2+). */
@@ -51,15 +56,6 @@ export interface CreateAppOptions {
 	addresses?: ConfiguredAddresses;
 	/** Sync/import status source for GET /api/v1/status (content-free). */
 	statusProvider?: () => StatusReport | Promise<StatusReport>;
-}
-
-const NO_STORE = "no-store";
-
-/** Every private API response is uncacheable. */
-function applyPrivateHeaders(headers: Headers): void {
-	headers.set("Cache-Control", NO_STORE);
-	headers.set("Pragma", "no-cache");
-	headers.set("X-Robots-Tag", "noindex, nofollow");
 }
 
 function jsonError(status: number, error: string): Response {
@@ -76,16 +72,6 @@ function jsonOk(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), { status, headers });
 }
 
-/**
- * Production private authorization.
- *
- * Until Cloudflare Access JWT verification is implemented, this denies every
- * private request — including requests that merely present Access identity
- * headers. Header presence alone is attacker-controlled and is not identity.
- */
-function denyPrivateAccess(): Response {
-	return jsonError(403, "Forbidden: Cloudflare Access verification is not available in this build");
-}
 
 /**
  * The exact private API surface. Unknown /api paths must answer with a JSON 404
@@ -93,12 +79,16 @@ function denyPrivateAccess(): Response {
  * treated as private resources.
  */
 function isPrivateApiPath(path: string): boolean {
+	// Attachment/download implementations are owned separately; their boundary
+	// must authenticate even while an unwired authenticated route returns 404.
+	if (/^\/api\/(?:v1\/)?(?:.*\/)?(?:attachments?|downloads?)(?:\/|$)/.test(path)) return true;
 	if (path === "/api/v1/config" || path === "/api/v1/mailboxes") return true;
 	if (path === "/api/v1/status") return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/emails$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+\/move$/.test(path)) return true;
+	if (/^\/api\/v1\/mailboxes\/[^/]+\/emails\/[^/]+\/(?:reply|forward)$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/folders$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/folders\/[^/]+$/.test(path)) return true;
 	if (/^\/api\/v1\/mailboxes\/[^/]+\/drafts$/.test(path)) return true;
@@ -111,25 +101,26 @@ export function createApp(options: CreateAppOptions): Hono {
 	const { config, mailStore, backend } = options;
 	const authMode: AuthMode = options.authMode ?? "access";
 
-	// A fixture auth mode must never be reachable in production, even if a
-	// caller passes it explicitly.
-	if (authMode === "fixture" && config.isProduction) {
-		throw new Error("Refusing to compose the app with fixture auth in production");
-	}
-
+	const gate = createRequestGate(config, authMode, options.accessTestOptions);
 	const app = new Hono();
+	app.use("*", async (c, next) => {
+		const path = new URL(c.req.url).pathname;
+		// Unknown APIs expose no resource and never fall back to HTML.
+		if ((path === "/api" || path.startsWith("/api/")) && !isPrivateApiPath(path)) {
+			return jsonError(404, "Not found");
+		}
+		const denied = await gate(c.req.raw);
+		if (denied) return denied;
+		await next();
+		applyPrivateHeaders(c.res.headers);
+	});
+	app.onError(() => jsonError(500, "Request failed"));
 
 	// --- Non-sensitive readiness ------------------------------------------
-	// Reachable without authentication. Exposes no identities, secrets, or
+	// Anonymous only with the loopback authority. Exposes no identities, secrets, or
 	// configuration values.
 	app.get("/health", (c) => {
-		c.header("Cache-Control", NO_STORE);
-		return c.json({
-			ok: true,
-			service: "harizco-post",
-			mode: authMode,
-			mailBackend: backend ? "configured" : mailStore ? "probe" : "unavailable",
-		});
+		return c.json({ ok: true });
 	});
 
 	// --- Private API ------------------------------------------------------
@@ -140,12 +131,7 @@ export function createApp(options: CreateAppOptions): Hono {
 			return jsonError(404, "Not found");
 		}
 
-		if (authMode === "access") {
-			// Fail closed: no verified identity is possible yet.
-			return denyPrivateAccess();
-		}
-
-		// authMode === "fixture": explicit test-only seam.
+		// The shared gate has already verified identity (or isolated test fixture).
 		const method = c.req.method;
 		mailStore?.record?.(method, path);
 
@@ -229,6 +215,73 @@ async function handlePrivateRoute(
 			const limit = clampInt(url.searchParams.get("limit"), 50, 1, 200);
 			const offset = clampInt(url.searchParams.get("offset"), 0, 0, 100000);
 			return jsonOk(await backend.listEmails(mailboxId, { limit, offset }));
+		}
+		if (m && method === "POST") {
+			// The browser's `sendEmail` posts here. Validation and idempotency
+			// live in the backend so a rejected send never reaches the relay.
+			const mailboxId = decodeURIComponent(m[1]);
+			const body = await readJson(c);
+			if (!body) return jsonError(400, "Invalid JSON body");
+			const from = typeof body.from === "string" ? body.from : "";
+			const to = asStringArray(body.to);
+			if (typeof body.body !== "string") return jsonError(400, "body is required");
+			if (!from || !to || to.length === 0) return jsonError(400, "from and to are required");
+			try {
+				const result = await backend.sendEmail({
+					mailboxId,
+					from,
+					to,
+					cc: asStringArray(body.cc) ?? [],
+					bcc: asStringArray(body.bcc) ?? [],
+					subject: typeof body.subject === "string" ? body.subject : "",
+					body: body.body,
+					...(typeof body.requestId === "string" ? { requestId: body.requestId } : {}),
+					...(typeof body.in_reply_to === "string" || body.in_reply_to === null ? { inReplyTo: body.in_reply_to as string | null } : {}),
+					...(Array.isArray(body.references) ? { references: asStringArray(body.references) ?? [] } : {}),
+				});
+				// An ambiguous result is 202, not 200: the client must reconcile.
+				return jsonOk(result, result.state === "unknown" ? 202 : 200);
+			} catch (err) {
+				if (err instanceof SubmissionValidationError) return jsonError(400, err.message);
+				return jsonError(502, "Submission failed");
+			}
+		}
+
+		m = /^\/api\/v1\/mailboxes\/([^/]+)\/emails\/([^/]+)\/(reply|forward)$/.exec(path);
+		if (m && method === "POST") {
+			// Recipients and threading headers come from the STORED message, never
+			// from the browser: a client-supplied list could widen a reply-all.
+			const mailboxId = decodeURIComponent(m[1]);
+			const emailId = decodeURIComponent(m[2]);
+			const kind = m[3];
+			const body = await readJson(c);
+			if (!body) return jsonError(400, "Invalid JSON body");
+			if (typeof body.body !== "string") return jsonError(400, "body is required");
+			const original = await backend.getEmail(emailId);
+			if (!original || !original.mailboxIds.includes(mailboxId)) {
+				return jsonError(404, "Email not found");
+			}
+			const from = typeof body.from === "string" && body.from ? body.from : (addresses?.emailAddresses[0] ?? "");
+			if (!from) return jsonError(400, "from is required");
+			try {
+				const input =
+					kind === "reply"
+						? buildReplySendInput(original, { from, body: body.body, replyAll: body.replyAll === true })
+						: buildForwardSendInput(original, {
+								from,
+								body: body.body,
+								to: asStringArray(body.to) ?? [],
+								// Only blobs the user explicitly selected ride out; the
+								// builder ignores ids the original does not carry.
+								attachmentBlobIds: asStringArray(body.attachmentBlobIds) ?? [],
+							});
+				if (input.to.length === 0) return jsonError(400, "no recipients resolved");
+				const result = await backend.sendEmail({ ...input, mailboxId });
+				return jsonOk(result, result.state === "unknown" ? 202 : 200);
+			} catch (err) {
+				if (err instanceof SubmissionValidationError) return jsonError(400, err.message);
+				return jsonError(502, "Submission failed");
+			}
 		}
 
 		m = /^\/api\/v1\/mailboxes\/([^/]+)\/emails\/([^/]+)\/move$/.exec(path);

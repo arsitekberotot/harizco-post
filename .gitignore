@@ -37,3 +37,7 @@ worker-configuration.d.ts
 playwright-report/
 test-results/
 coverage/
+
+# Python bytecode caches (integration test helpers)
+__pycache__/
+*.pyc

@@ -31,9 +31,18 @@ export interface EmailDto {
 	subject: string;
 	from: { name?: string; email: string }[];
 	to: { name?: string; email: string }[];
+	/** Cc recipients; needed to resolve reply-all without re-adding ourselves. */
+	cc: { name?: string; email: string }[];
+	/** Reply-To, when the sender set one; replies prefer it over From. */
+	replyTo?: { name?: string; email: string }[];
 	receivedAt: string;
 	preview: string;
 	hasAttachment: boolean;
+	/**
+	 * Attachment blobs, when the adapter loads them. A forward may carry a
+	 * user-selected subset; identity is the JMAP blob id, never the filename.
+	 */
+	attachments?: { blobId: string; size: number; name?: string; type?: string }[];
 	/** RFC Message-ID, e.g. "<abc@example.com>". Not an internal identifier. */
 	messageId: string | null;
 	inReplyTo: string[];
@@ -56,9 +65,12 @@ export interface JmapEmailShape {
 	subject?: string;
 	from?: { name?: string; email: string }[];
 	to?: { name?: string; email: string }[];
+	cc?: { name?: string; email: string }[];
+	replyTo?: { name?: string; email: string }[];
 	receivedAt?: string;
 	preview?: string;
 	hasAttachment?: boolean;
+	attachments?: { blobId: string; size: number; name?: string; type?: string }[];
 	messageId?: string[];
 	inReplyTo?: string[];
 	references?: string[];
@@ -90,9 +102,12 @@ export function mapEmail(e: JmapEmailShape): EmailDto {
 		subject: e.subject ?? "",
 		from: e.from ?? [],
 		to: e.to ?? [],
+		cc: e.cc ?? [],
+		...(e.replyTo?.length ? { replyTo: e.replyTo } : {}),
 		receivedAt: e.receivedAt ?? "",
 		preview: e.preview ?? "",
 		hasAttachment: Boolean(e.hasAttachment),
+		...(e.attachments?.length ? { attachments: e.attachments } : {}),
 		messageId: e.messageId?.[0] ?? null,
 		inReplyTo: e.inReplyTo ?? [],
 		references: e.references ?? [],

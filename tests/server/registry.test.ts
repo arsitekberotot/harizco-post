@@ -4,7 +4,7 @@
 //
 // Task 6: mailbox configuration and integration journal.
 
-import { beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { openJournal, type Journal } from "../../server/db/index";
 import { MailboxRegistry, RegistryError, deleteMailbox } from "../../server/mailboxes/registry";
 import { DEFAULT_SETTINGS, SettingsStore, provisionMailbox, validateSettings } from "../../server/mailboxes/setup";
@@ -17,7 +17,82 @@ beforeEach(() => {
 	registry = new MailboxRegistry(db);
 });
 
+afterEach(() => { db.close(); });
+
 describe("mailbox registry", () => {
+	test.each(["false", "true", 0, 1, null])("operator setup rejects non-boolean activation %j before mutation", enable => {
+		expect(() => provisionMailbox({ db, registry }, {
+			id: "mb1", address: "fixture@example.test", jmapAccountId: "fixture-account", enable: enable as never,
+		})).toThrow(RegistryError);
+		expect(registry.listAll()).toEqual([]);
+	});
+	test("a registry from another connection cannot escape the setup transaction", () => {
+		const other = openJournal(":memory:");
+		try {
+			const wrong = new MailboxRegistry(other);
+			expect(() => provisionMailbox({ db, registry: wrong }, { id: "mb1", address: "fixture@example.test", enable: true })).toThrow(RegistryError);
+			expect(registry.listAll()).toEqual([]);
+			expect(wrong.listAll()).toEqual([]);
+		} finally { other.close(); }
+	});
+	test("browser activation can only enable an already operator-provisioned address", () => {
+		expect(typeof registry.activateByAddress).toBe("function");
+		expect(() => registry.activateByAddress("new@example.test")).toThrow(RegistryError);
+		expect(registry.listAll()).toEqual([]);
+		registry.provision({ id: "mb1", address: "owner@example.test", jmapAccountId: "account1" });
+		expect(registry.activateByAddress("OWNER@example.test")).toMatchObject({ id: "mb1", enabled: 1, jmap_account_id: "account1" });
+		expect(registry.listAll()).toHaveLength(1);
+	});
+
+	test("unbound identities remain disabled on browser activation", () => {
+		registry.provision({ id: "mb1", address: "owner@example.test" });
+		expect(typeof registry.activateByAddress).toBe("function");
+		expect(() => registry.activateByAddress("owner@example.test")).toThrow(RegistryError);
+		expect(registry.getById("mb1")?.enabled).toBe(0);
+	});
+
+	test("enable input must be an actual boolean, not a truthy browser string", () => {
+		registry.provision({ id: "mb1", address: "a@example.test", jmapAccountId: "account1" });
+		expect(() => registry.setEnabled("mb1", "false" as never)).toThrow(RegistryError);
+		expect(registry.getById("mb1")?.enabled).toBe(0);
+	});
+	test("canonical bindings remain immutable after unlink so old mail cannot be silently remapped", () => {
+		registry.provision({ id: "mb1", address: "a@example.test", jmapAccountId: "account1" });
+		registry.unlink("mb1");
+		expect(() => registry.bindAccount("mb1", "account2")).toThrow(RegistryError);
+		expect(registry.getById("mb1")?.jmap_account_id).toBe("account1");
+	});
+
+	test("control characters are refused in configured identities and initial bindings", () => {
+		expect(() => registry.provision({ id: "mb1", address: "a\0@example.test" })).toThrow(RegistryError);
+		expect(() => registry.provision({ id: "mb1", address: "a@example.test", jmapAccountId: "\0account" })).toThrow(RegistryError);
+		expect(registry.listAll()).toEqual([]);
+	});
+
+	test("legacy enabled-but-unbound records never appear as sendable", () => {
+		db.prepare("INSERT INTO mailboxes(id,address,enabled,created_at) VALUES ('legacy','legacy@example.test',1,'fixture')").run();
+		expect(registry.listEnabled()).toEqual([]);
+	});
+	test("empty identity and account bindings are refused without mutation", () => {
+		expect(() => registry.provision({ id: "", address: "a@example.test" })).toThrow(RegistryError);
+		expect(registry.listAll()).toEqual([]);
+		registry.provision({ id: "mb1", address: "a@example.test" });
+		expect(() => registry.bindAccount("mb1", " ")).toThrow(RegistryError);
+		expect(registry.getById("mb1")?.jmap_account_id).toBeNull();
+	});
+
+	test("an enabled mailbox cannot silently change canonical account", () => {
+		registry.provision({ id: "mb1", address: "a@example.test", jmapAccountId: "account1" });
+		registry.setEnabled("mb1", true);
+		expect(() => registry.bindAccount("mb1", "account2")).toThrow(RegistryError);
+		expect(registry.getById("mb1")?.jmap_account_id).toBe("account1");
+		expect(() => registry.bindAccount("mb1", "account1")).not.toThrow();
+	});
+
+	test("failed operator setup is atomic and leaves no partial identity", () => {
+		expect(() => provisionMailbox({ db, registry }, { id: "mb1", address: "a@example.test", enable: true })).toThrow(RegistryError);
+		expect(registry.listAll()).toEqual([]);
+	});
 	test("operator provisioning stores a normalized address, disabled by default", () => {
 		const rec = registry.provision({ id: "mb1", address: "Hanif@Atelieriza.com", displayName: "Hanif" });
 		expect(rec.address).toBe("hanif@atelieriza.com");
@@ -122,6 +197,27 @@ describe("import job uniqueness", () => {
 });
 
 describe("settings validation", () => {
+	test("corrupt stored settings fail closed without echoing the stored body", () => {
+		const store = new SettingsStore(db);
+		db.prepare("INSERT INTO app_settings(key,value) VALUES ('app_settings',?)").run("opaque-fixture-value invalid-json");
+		expect(() => store.read()).toThrow(RegistryError);
+		try { store.read(); } catch (error) {
+			expect((error as Error).message).not.toContain("opaque-fixture-value");
+		}
+	});
+	test("provider page size follows the actual maximum of 100", () => {
+		expect(validateSettings({ providerPageSize: 100 }).providerPageSize).toBe(100);
+		expect(() => validateSettings({ providerPageSize: 101 })).toThrow(/providerPageSize/);
+	});
+
+	test("partial settings writes preserve earlier fields and malformed writes do not mutate", () => {
+		const store = new SettingsStore(db);
+		store.write({ publicHostname: "post.example.test", pollIntervalSeconds: 120 });
+		store.write({ providerPageSize: 25 });
+		expect(store.read()).toMatchObject({ publicHostname: "post.example.test", pollIntervalSeconds: 120, providerPageSize: 25 });
+		expect(() => store.write([])).toThrow(RegistryError);
+		expect(store.read().providerPageSize).toBe(25);
+	});
 	test("defaults are bounded and do not permit an unsafe poll interval", () => {
 		expect(DEFAULT_SETTINGS.pollIntervalSeconds).toBeGreaterThanOrEqual(30);
 		expect(() => validateSettings({ pollIntervalSeconds: 1 })).toThrow(/between 30 and 86400/);

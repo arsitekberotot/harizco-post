@@ -2,13 +2,19 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import DOMPurify from "dompurify";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { sanitizeEmailContent, type EmailContentOptions } from "../lib/sanitize-email";
 
-interface EmailIframeProps {
+interface EmailIframeProps extends EmailContentOptions {
 	body: string;
 	/** When true, iframe auto-sizes to content height instead of filling parent */
 	autoSize?: boolean;
+	/**
+	 * Block remote images (tracking pixels) by default. The user may opt in to
+	 * loading them for a specific message; that explicit choice is the only way
+	 * a remote image is requested. (Task 17)
+	 */
+	blockRemoteImages?: boolean;
 }
 
 /**
@@ -22,12 +28,12 @@ interface EmailIframeProps {
  * - Because the iframe is cross-origin we cannot read `contentDocument`
  *   for auto-sizing. Instead, the injected HTML includes a tiny inline
  *   script that posts its body height to the parent via `postMessage`.
- *   The `allow-scripts` flag is required for this, but scripts inside
- *   the opaque-origin sandbox cannot access anything useful.
+ *   Only the nonce-bearing height script can run. The opaque origin alone
+ *   does not stop tracking; the sanitizer and CSP enforce the resource policy.
  * - A strict CSP meta tag blocks external resource loads inside the
  *   iframe as a defense-in-depth layer.
  */
-export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
+export default function EmailIframe({ body, autoSize, blockRemoteImages = true, contentType, resolveCidImage }: EmailIframeProps) {
 	const iframeRef = useRef<HTMLIFrameElement>(null);
 	const [height, setHeight] = useState(autoSize ? 100 : 0);
 
@@ -57,14 +63,13 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 
 	useEffect(() => {
 		const iframe = iframeRef.current;
-		if (!iframe || !body) return;
+		if (!iframe) return;
 
-		const cleanBody = DOMPurify.sanitize(body, {
-			USE_PROFILES: { html: true },
-			FORBID_TAGS: ["style"],
-			ADD_ATTR: ["target"],
-			FORCE_BODY: true,
-		});
+		const rendered = sanitizeEmailContent(body, { blockRemoteImages, contentType, resolveCidImage });
+		const imgSrc = blockRemoteImages ? "data:" : "data: https:";
+		// Only our height script can run, even if a sanitizer bypass occurs.
+		const nonce = crypto.randomUUID().replace(/-/g, "");
+		const scriptSrc = autoSize ? `'nonce-${nonce}'` : "'none'";
 
 		const padding = autoSize ? "0" : "24px";
 
@@ -72,7 +77,7 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 		// Runs inside the opaque-origin sandbox so it has zero access to
 		// the parent page — it can only postMessage.
 		const heightScript = autoSize
-			? `<script>
+			? `<script nonce="${nonce}">
 				function reportHeight() {
 					var h = document.body.scrollHeight;
 					if (h > 0) parent.postMessage({ __emailIframeHeight: true, height: h }, "*");
@@ -91,8 +96,9 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid: https:; script-src 'unsafe-inline';">
-<style>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; style-src 'nonce-${nonce}'; img-src ${imgSrc}; script-src ${scriptSrc};">
+<meta name="referrer" content="no-referrer">
+<style nonce="${nonce}">
 * { box-sizing: border-box; }
 html {
 	background: #ffffff;
@@ -135,16 +141,17 @@ h1, h2, h3 { margin: 8px 0 4px; }
 ul, ol { padding-left: 20px; margin: 4px 0; }
 </style>
 </head>
-<body>${cleanBody}${heightScript}</body>
+<body>${rendered}${heightScript}</body>
 </html>`;
-	}, [body, autoSize]);
+	}, [body, autoSize, blockRemoteImages, contentType, resolveCidImage]);
 
 	return (
 		<iframe
 			ref={iframeRef}
 			className="block w-full border-0"
 			style={autoSize ? { height: `${height}px` } : { height: "100%" }}
-			sandbox="allow-scripts allow-popups allow-top-navigation-by-user-activation"
+			sandbox="allow-scripts allow-popups"
+			referrerPolicy="no-referrer"
 			title="Email content"
 		/>
 	);

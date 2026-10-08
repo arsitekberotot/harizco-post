@@ -17,6 +17,8 @@ import type {
 	FlagInput,
 	DraftInput,
 	FolderMutationInput,
+	SendInput,
+	SendResult,
 } from "../../server/mail/backend";
 
 /** In-memory backend used to prove routes forward faithfully to a backend. */
@@ -37,6 +39,7 @@ function fakeBackend(): MailBackend & { calls: string[] } {
 			subject: "Hello",
 			from: [{ email: "sender@example.test" }],
 			to: [{ email: "owner@example.invalid" }],
+			cc: [],
 			receivedAt: "2026-10-07T05:00:00Z",
 			preview: "hi",
 			hasAttachment: false,
@@ -99,6 +102,10 @@ function fakeBackend(): MailBackend & { calls: string[] } {
 		async health(): Promise<{ ok: boolean }> {
 			calls.push("health");
 			return { ok: true };
+		},
+		async sendEmail(input: SendInput): Promise<SendResult> {
+			calls.push(`sendEmail:${input.subject ?? ""}`);
+			return { requestId: "req-wiring", state: "queued" };
 		},
 	};
 	return backend;

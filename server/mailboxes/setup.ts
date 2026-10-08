@@ -37,9 +37,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
 const SETTINGS_KEY = "app_settings";
 
-interface Validator<T> {
-	(value: unknown): T;
-}
 
 function asRecord(value: unknown): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -100,8 +97,8 @@ export function validateSettings(value: unknown): AppSettings {
 
 	if (raw.providerPageSize !== undefined) {
 		const n = raw.providerPageSize;
-		if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 200) {
-			throw new RegistryError("invalid_settings", "providerPageSize must be an integer between 1 and 200.");
+		if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 100) {
+			throw new RegistryError("invalid_settings", "providerPageSize must be an integer between 1 and 100.");
 		}
 		out.providerPageSize = n;
 	}
@@ -114,10 +111,6 @@ export class SettingsStore {
 
 	constructor(db: Journal) {
 		this.#db = db;
-		this.#db.exec(`CREATE TABLE IF NOT EXISTS app_settings (
-			key   TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		);`);
 	}
 
 	read(): AppSettings {
@@ -125,17 +118,23 @@ export class SettingsStore {
 			| { value: string }
 			| undefined;
 		if (!row) return { ...DEFAULT_SETTINGS };
-		return validateSettings(JSON.parse(row.value));
+		try {
+			return validateSettings(JSON.parse(row.value));
+		} catch {
+			throw new RegistryError("invalid_settings", "Stored settings are invalid; operator repair is required.");
+		}
 	}
 
 	write(value: unknown): AppSettings {
-		const validated = validateSettings(value);
-		this.#db
-			.prepare(
-				"INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-			)
-			.run(SETTINGS_KEY, JSON.stringify(validated));
-		return validated;
+		return this.#db.transaction(() => {
+			const validated = validateSettings({ ...this.read(), ...asRecord(value) });
+			this.#db
+				.prepare(
+					"INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				)
+				.run(SETTINGS_KEY, JSON.stringify(validated));
+			return validated;
+		}).immediate();
 	}
 }
 
@@ -152,21 +151,25 @@ export function provisionMailbox(
 	opts: SetupOptions,
 	input: { id: string; address: string; displayName?: string; jmapAccountId?: string | null; enable?: boolean },
 ): ReturnType<MailboxRegistry["provision"]> {
+	if (input.enable !== undefined && typeof input.enable !== "boolean") {
+		throw new RegistryError("invalid_enabled", "Mailbox activation must be a boolean.");
+	}
 	const registry = opts.registry ?? new MailboxRegistry(opts.db);
-	if (!isValidAddress(input.address)) {
-		throw new RegistryError("invalid_address", `Refusing to provision invalid address: ${input.address}`);
+	if (!registry.isBackedBy(opts.db)) {
+		throw new RegistryError("wrong_journal", "Setup registry and transaction must use the same journal connection.");
 	}
-	const rec = registry.provision({
-		id: input.id,
-		address: normalizeAddress(input.address),
-		displayName: input.displayName,
-		jmapAccountId: input.jmapAccountId ?? null,
-	});
-	if (input.jmapAccountId) {
-		registry.bindAccount(rec.id, input.jmapAccountId);
-	}
-	if (input.enable) {
-		return registry.setEnabled(rec.id, true);
-	}
-	return registry.getById(rec.id)!;
+	return opts.db.transaction(() => {
+		if (!isValidAddress(input.address)) {
+			throw new RegistryError("invalid_address", `Refusing to provision invalid address: ${input.address}`);
+		}
+		const rec = registry.provision({
+			id: input.id,
+			address: normalizeAddress(input.address),
+			displayName: input.displayName,
+			jmapAccountId: input.jmapAccountId ?? null,
+		});
+		if (input.jmapAccountId) registry.bindAccount(rec.id, input.jmapAccountId);
+		if (input.enable === true) return registry.setEnabled(rec.id, true);
+		return registry.getById(rec.id)!;
+	}).immediate();
 }

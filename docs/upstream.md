@@ -4,7 +4,7 @@ Harizco Post is a local-runtime fork of [Cloudflare Agentic Inbox](https://githu
 
 - Pinned source: `48039bb6785af34e592c2966f87cde2b255c4c80`.
 - Upstream license: Apache-2.0. Keep `LICENSE` and existing source copyright/license headers.
-- Local implementation branch: `harizco/phase-1`.
+- Local implementation branch: `harizco/implementation` (continued from existing implementation commits on `main`; the earlier `harizco/phase-1` branch remains at the upstream baseline).
 - Fetch remote: `upstream`, pointing to `https://github.com/cloudflare/agentic-inbox.git`.
 - Upstream push URL is intentionally disabled (`no-push://cloudflare/agentic-inbox`). No GitHub fork, writable origin, push, or publication has been authorized.
 

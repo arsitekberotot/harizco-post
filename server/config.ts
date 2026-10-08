@@ -4,12 +4,10 @@
 //
 // Harizco Post: local Node runtime configuration.
 //
-// Loopback-only. Production private access fails closed: no TEAM_DOMAIN,
-// POLICY_AUD and OWNER_EMAIL means the process refuses to start rather than
-// serve an unauthenticated mailbox. Dev/fixture bypass flags are rejected in
-// production — a bypass is never reachable through environment variables
-// alone. Real Cloudflare Access JWT verification lands in a later task; until
-// then the production path denies every private request.
+// Loopback-only. Production requires a validated Access owner configuration
+// and canonical public browser origin. Environment flags never enable auth bypass.
+
+import { parseAccessConfig, parsePublicOrigin } from "./auth/configuration";
 
 /** Cloudflare Access identity assumptions required for production start. */
 export interface AppAccessConfig {
@@ -24,11 +22,18 @@ export interface AppConfig {
 	readonly port: number;
 	readonly nodeEnv: string;
 	readonly isProduction: boolean;
+	/** Canonical HTTPS browser origin, distinct from loopback HTTP transport. */
+	readonly publicOrigin?: string;
 	/**
 	 * Present only when a complete, valid Access configuration was supplied.
 	 * Absent means every private request is denied (fail closed).
 	 */
 	readonly access?: AppAccessConfig;
+	/**
+	 * Optional private mailbox binding. Null means no mail backend is wired, so
+	 * authenticated reads must return an honest 503 rather than fabricate data.
+	 */
+	readonly mailbox: MailboxBinding | null;
 }
 
 const LOOPBACK_HOST = "127.0.0.1";
@@ -53,11 +58,11 @@ function isTruthy(value: string | undefined): boolean {
 function parsePort(raw: string | undefined): number {
 	if (raw === undefined || raw.trim() === "") return DEFAULT_PORT;
 	if (!/^\d+$/.test(raw.trim())) {
-		throw new Error(`Invalid PORT: expected an integer 1-65535, received "${raw}"`);
+		throw new Error("Invalid PORT: expected an integer 1-65535");
 	}
 	const port = Number.parseInt(raw.trim(), 10);
 	if (port < MIN_PORT || port > MAX_PORT) {
-		throw new Error(`Invalid PORT: ${port} is outside 1-65535`);
+		throw new Error("Invalid PORT: expected an integer 1-65535");
 	}
 	return port;
 }
@@ -77,7 +82,7 @@ export function loadConfig(env: Record<string, string | undefined> = {}): AppCon
 	const requestedHost = (env.HOST ?? env.BIND_HOST ?? "").trim();
 	if (requestedHost !== "" && requestedHost !== LOOPBACK_HOST) {
 		throw new Error(
-			`Invalid HOST "${requestedHost}": Harizco Post only binds the loopback address ${LOOPBACK_HOST}`,
+			`Invalid HOST: Harizco Post only binds the loopback address ${LOOPBACK_HOST}`,
 		);
 	}
 
@@ -85,47 +90,25 @@ export function loadConfig(env: Record<string, string | undefined> = {}): AppCon
 
 	const requestedBypasses = BYPASS_FLAGS.filter((flag) => isTruthy(env[flag]));
 
-	const teamDomain = (env.TEAM_DOMAIN ?? "").trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
-	const policyAud = (env.POLICY_AUD ?? "").trim();
-	const ownerEmail = (env.OWNER_EMAIL ?? "").trim();
-
-	const hasCompleteAccess = teamDomain !== "" && policyAud !== "" && ownerEmail !== "";
-
-	if (isProduction) {
-		if (!hasCompleteAccess) {
-			const missing = [
-				teamDomain === "" ? "TEAM_DOMAIN" : null,
-				policyAud === "" ? "POLICY_AUD" : null,
-				ownerEmail === "" ? "OWNER_EMAIL" : null,
-			].filter((name): name is string => name !== null);
-			throw new Error(
-				`Refusing to start in production without Cloudflare Access configuration (missing: ${missing.join(", ")}). ` +
-					"Harizco Post fails closed rather than serve an unauthenticated mailbox.",
-			);
-		}
-		if (requestedBypasses.length > 0) {
-			throw new Error(
-				`Refusing to start in production with authentication bypass flags set (${requestedBypasses.join(", ")}). ` +
-					"Fixture/dev bypass is never enabled by environment variables in production.",
-			);
-		}
+	if (isProduction && requestedBypasses.length > 0) {
+		throw new Error("Refusing to start in production with authentication bypass flags");
 	}
-
-	const access: AppAccessConfig | undefined = hasCompleteAccess
-		? {
-				teamDomain:
-					teamDomain === "" || teamDomain.includes(".") ? teamDomain : `${teamDomain}.cloudflareaccess.com`,
-				policyAud,
-				ownerEmail,
-			}
-		: undefined;
+	const teamDomain = env.TEAM_DOMAIN ?? "";
+	const policyAud = env.POLICY_AUD ?? "";
+	const ownerEmail = env.OWNER_EMAIL ?? "";
+	const anyAccess = teamDomain !== "" || policyAud !== "" || ownerEmail !== "";
+	const access = anyAccess || isProduction ? parseAccessConfig(teamDomain, policyAud, ownerEmail) : undefined;
+	const rawOrigin = env.PUBLIC_ORIGIN ?? "";
+	const publicOrigin = rawOrigin !== "" || isProduction ? parsePublicOrigin(rawOrigin) : undefined;
 
 	return {
 		host: LOOPBACK_HOST,
 		port,
 		nodeEnv,
 		isProduction,
+		...(publicOrigin ? { publicOrigin } : {}),
 		...(access ? { access } : {}),
+		mailbox: loadMailboxBinding(env),
 	};
 }
 
@@ -165,10 +148,155 @@ export interface SyncConfig {
 }
 
 const DEFAULT_INTERVAL_SECONDS = 60;
+/** Web-process mailbox binding (private JMAP read path). */
+export interface MailboxBinding {
+	/** JMAP endpoint reachable from the web process (loopback Stalwart). */
+	readonly url: string;
+	/** JMAP username. */
+	readonly username: string;
+	/** JMAP secret; never logged. */
+	readonly secret: string;
+	/** Account to bind; discovered from the session when absent. */
+	readonly accountId?: string;
+}
+
+/**
+ * Load the optional web mailbox binding.
+ *
+ * Returns null when unset so an authenticated read keeps its honest 503
+ * instead of the server fabricating mail. Throws when the binding is partially
+ * configured: a half-set credential must refuse to start, not silently degrade.
+ */
+export function loadMailboxBinding(env: Record<string, string | undefined> = {}): MailboxBinding | null {
+	const raw = {
+		url: env.STALWART_URL?.trim() ?? "",
+		username: env.STALWART_USERNAME?.trim() ?? "",
+		secret: env.STALWART_SECRET?.trim() ?? "",
+		accountId: env.STALWART_ACCOUNT_ID?.trim() ?? "",
+	};
+	const present = [raw.url, raw.username, raw.secret].filter(Boolean);
+	if (present.length === 0) return null;
+	for (const [key, value] of [["STALWART_URL", raw.url], ["STALWART_USERNAME", raw.username], ["STALWART_SECRET", raw.secret]] as const) {
+		if (!value) throw new Error(`Incomplete mailbox binding: ${key} is required when any STALWART_* mailbox variable is set`);
+	}
+	if (!/^https?:\/\//.test(raw.url)) throw new Error(`Invalid STALWART_URL: expected an http(s) URL, received a non-URL value`);
+	return {
+		url: raw.url.replace(/\/$/, ""),
+		username: raw.username,
+		secret: raw.secret,
+		...(raw.accountId ? { accountId: raw.accountId } : {}),
+	};
+}
+
 // The runner refuses intervals below 30s to respect provider rate limits, so
 // the config floor matches rather than accepting a value the runner rejects.
 const MIN_INTERVAL_SECONDS = 30;
 const MAX_INTERVAL_SECONDS = 3600;
+
+/**
+ * Web-process outbound submission binding.
+ *
+ * Presence of ANY of these variables turns on the real send path: the web
+ * process records the durable intent and hands the payload to
+ * `OUTBOUND_RELAY_URL` (the worker's relay), which holds the provider secret.
+ * Absent, `sendEmail` refuses rather than claiming a message was sent.
+ */
+export interface OutboundBinding {
+	/** SQLite journal the submission intents are recorded in. */
+	readonly dbPath: string;
+	/** Owned sender address every From must match. */
+	readonly address: string;
+	/** Owned domain every From must be on (defaults from the address). */
+	readonly domain: string;
+	/** Max total recipients across To+Cc+Bcc. */
+	readonly maxRecipients: number;
+	/** Max message size in bytes. */
+	readonly maxBytes: number;
+	/** Provider the worker relays through (label only in the web process). */
+	readonly relayUrl: string;
+}
+
+const DEFAULT_MAX_RECIPIENTS = 20;
+const DEFAULT_MAX_BYTES = 5_000_000;
+
+/**
+ * Load the optional outbound submission binding.
+ *
+ * Returns null when unset (honest refusal on send) and throws when partially
+ * configured — a half-set sender identity must refuse to start rather than
+ * silently send From the wrong address.
+ */
+export function loadOutboundBinding(env: Record<string, string | undefined> = {}): OutboundBinding | null {
+	const address = (env.OUTBOUND_FROM ?? "").trim();
+	const relayUrl = (env.OUTBOUND_RELAY_URL ?? "").trim();
+	if (!address && !relayUrl) return null;
+	if (!address || !relayUrl) {
+		throw new Error("Incomplete outbound binding: OUTBOUND_FROM and OUTBOUND_RELAY_URL must both be set");
+	}
+	if (!/^[^@\s]+@[^@\s]+$/.test(address)) throw new Error("Invalid OUTBOUND_FROM: expected a single email address");
+	if (!/^https?:\/\//.test(relayUrl)) throw new Error("Invalid OUTBOUND_RELAY_URL: expected an http(s) URL");
+	const domain = (env.OUTBOUND_DOMAIN ?? address.split("@")[1] ?? "").trim().toLowerCase();
+	return {
+		dbPath: (env.SYNC_DB_PATH ?? env.DB_PATH ?? "var/harizco-post.sqlite").trim(),
+		address: address.toLowerCase(),
+		domain,
+		maxRecipients: intOrDefault(env.OUTBOUND_MAX_RECIPIENTS, DEFAULT_MAX_RECIPIENTS),
+		maxBytes: intOrDefault(env.OUTBOUND_MAX_BYTES, DEFAULT_MAX_BYTES),
+		relayUrl: relayUrl.replace(/\/$/, ""),
+	};
+}
+
+function intOrDefault(raw: string | undefined, fallback: number): number {
+	const value = (raw ?? "").trim();
+	if (value === "") return fallback;
+	if (!/^\d+$/.test(value)) throw new Error(`Expected a positive integer, received "${raw}"`);
+	return Number.parseInt(value, 10);
+}
+
+/**
+ * Worker-side relay listener binding.
+ *
+ * The relay endpoint owns the provider secret, so it runs in the worker, not
+ * the web process. It binds loopback-only: the web process reaches it over
+ * 127.0.0.1, and nothing public is ever exposed.
+ */
+export interface RelayBinding {
+	/** Loopback host to bind. */
+	readonly host: string;
+	readonly port: number;
+	/** Shared secret the web process presents; never logged. */
+	readonly secret: string;
+	/** Resend API key used to actually send. */
+	readonly apiKey: string;
+	readonly baseUrl: string;
+}
+
+/**
+ * Load the optional relay binding.
+ *
+ * Returns null when unset (no relay listener). Throws when partially
+ * configured — a relay without a secret would be an open send path, so a
+ * half-set binding must refuse to start.
+ */
+export function loadRelayBinding(env: Record<string, string | undefined> = {}): RelayBinding | null {
+	const secret = (env.RELAY_SHARED_SECRET ?? "").trim();
+	const apiKey = (env.RELAY_RESEND_API_KEY ?? "").trim();
+	if (!secret && !apiKey) return null;
+	if (!secret || !apiKey) {
+		throw new Error("Incomplete relay binding: RELAY_SHARED_SECRET and RELAY_RESEND_API_KEY must both be set");
+	}
+	const host = (env.RELAY_HOST ?? "127.0.0.1").trim();
+	if (host !== "127.0.0.1" && host !== "::1") {
+		throw new Error("Invalid RELAY_HOST: the relay must bind loopback only");
+	}
+	return {
+		host,
+		port: intOrDefault(env.RELAY_PORT, 8788),
+		secret,
+		apiKey,
+		baseUrl: (env.RELAY_RESEND_BASE_URL ?? "https://api.resend.com").trim().replace(/\/$/, ""),
+	};
+}
 
 function required(env: Record<string, string | undefined>, name: string): string {
 	const value = (env[name] ?? "").trim();

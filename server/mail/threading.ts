@@ -22,10 +22,17 @@ export class SenderValidationError extends Error {
 
 export type AddressInput = string | { email: string; name?: string };
 
-/** Strip surrounding angle brackets from an RFC 5322 message id. */
+const ID_ATOM = "[A-Za-z0-9!#$%&'*+\\-/=?^_`{|}~]+";
+const ID_DOT_ATOM = `${ID_ATOM}(?:\\.${ID_ATOM})*`;
+const RFC_MESSAGE_ID = new RegExp(`^${ID_DOT_ATOM}@(?:${ID_DOT_ATOM}|\\[[\\x21-\\x5a\\x5e-\\x7e]+\\])$`);
+
+/** Normalize a supported RFC 5322 message id, never a local record id. */
 function bareMessageId(value: string): string {
+	if (typeof value !== "string" || /[\r\n\x00]/.test(value)) throw new Error("Invalid RFC Message-ID.");
 	const trimmed = value.trim();
-	return trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1).trim() : trimmed;
+	const bare = trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1) : trimmed;
+	if (!RFC_MESSAGE_ID.test(bare)) throw new Error("Invalid RFC Message-ID.");
+	return bare;
 }
 
 /**
@@ -134,7 +141,9 @@ export interface ReferenceChain {
  * the message being replied to, with the thread pinned to the original thread.
  */
 export function buildReferencesChain(original: ThreadableMessage): ReferenceChain {
-	const originalMessageId = bareMessageId(original.messageId ?? original.id);
+	// A missing header is legitimate; omit threading headers rather than forge
+	// one from Stalwart's opaque Email/id. Local thread IDs stay local.
+	const originalMessageId = original.messageId ? bareMessageId(original.messageId) : "";
 	const existing = (original.references ?? [])
 		.filter((r): r is string => typeof r === "string" && r !== "")
 		.map(bareMessageId);
@@ -149,8 +158,8 @@ export function buildThreadingHeaders(
 	references: readonly string[],
 ): Record<string, string> {
 	const headers: Record<string, string> = {};
-	if (originalMessageId) headers["In-Reply-To"] = `<${originalMessageId}>`;
-	const refs = dedupe(references.filter((r) => r !== ""));
+	if (originalMessageId) headers["In-Reply-To"] = `<${bareMessageId(originalMessageId)}>`;
+	const refs = dedupe(references.filter((r) => r !== "").map(bareMessageId));
 	if (refs.length > 0) headers.References = refs.map((r) => `<${r}>`).join(" ");
 	return headers;
 }
@@ -185,6 +194,8 @@ export interface ReplyAllInput {
 	/** The owned mailbox address; always removed from every recipient list. */
 	mailboxAddress: string;
 	originalFrom?: AddressInput | AddressInput[] | null;
+	/** Reply-To is authoritative when present; From is only the fallback. */
+	originalReplyTo?: AddressInput | AddressInput[] | null;
 	originalTo?: AddressInput | AddressInput[] | null;
 	originalCc?: AddressInput | AddressInput[] | null;
 }
@@ -206,7 +217,8 @@ export interface ReplyAllRecipients {
  */
 export function computeReplyAll(input: ReplyAllInput): ReplyAllRecipients {
 	const owner = input.mailboxAddress.trim().toLowerCase();
-	const from = normalizeAddressList(input.originalFrom).filter((a) => a !== owner);
+	const replyTo = normalizeAddressList(input.originalReplyTo);
+	const from = (replyTo.length ? replyTo : normalizeAddressList(input.originalFrom)).filter((a) => a !== owner);
 	const to = normalizeAddressList(input.originalTo).filter((a) => a !== owner);
 	const cc = normalizeAddressList(input.originalCc).filter((a) => a !== owner);
 

@@ -1,0 +1,20 @@
+From: Fixture Sender <sender@example.test>
+To: Fixture User <fixture@harizco.test>
+Subject: Harizco fixture inline image
+Message-ID: <fixture-inline@harizco.test>
+Date: Wed, 07 Oct 2026 12:02:00 +0700
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="fixture-related"
+
+--fixture-related
+Content-Type: text/html; charset=utf-8
+
+<p>Inline fixture <img src="cid:fixture-image" alt="one pixel"></p>
+--fixture-related
+Content-Type: image/png; name="pixel.png"
+Content-ID: <fixture-image>
+Content-Disposition: inline; filename="pixel.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4WQAAAAASUVORK5CYII=
+--fixture-related--

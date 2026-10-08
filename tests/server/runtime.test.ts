@@ -97,7 +97,9 @@ describe("createApp runtime contracts", () => {
 
 	test("health is non-sensitive and reachable without Access", async () => {
 		const { app } = createTestApp({ authMode: "access" });
-		const response = await app.request("/health");
+		const response = await app.request("http://127.0.0.1:3000/health", {
+			headers: { host: "127.0.0.1:3000" },
+		});
 		expect(response.status).toBe(200);
 		const body = (await response.json()) as Record<string, unknown>;
 		expect(body.ok).toBe(true);

@@ -78,6 +78,7 @@ const PRODUCTION_ACCESS_ENV = {
 	TEAM_DOMAIN: "example.cloudflareaccess.com",
 	POLICY_AUD: "test-policy-aud",
 	OWNER_EMAIL: "owner@example.invalid",
+	PUBLIC_ORIGIN: "https://example.invalid",
 } as const;
 
 export function productionAccessEnv(

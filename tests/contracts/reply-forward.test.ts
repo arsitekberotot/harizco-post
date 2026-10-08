@@ -47,6 +47,27 @@ describe("sender ownership (no open relay)", () => {
 });
 
 describe("reply threading", () => {
+	test("a missing RFC Message-ID never fabricates a header from a local record ID", () => {
+		const chain = buildReferencesChain({ id: "opaque-local-record", threadId: "opaque-thread" });
+		expect(chain.originalMessageId).toBe("");
+		expect(chain.references).toEqual([]);
+		expect(buildThreadingHeaders(chain.originalMessageId, chain.references)).toEqual({});
+	});
+
+	test("malformed RFC IDs and header injection are rejected instead of emitted", () => {
+		for (const value of ["opaque-local-record", "<m@example.test>\r\nBcc: hidden@example.test", "<m@example.test> <other@example.test>", "<m @example.test>"]) {
+			expect(() => buildReferencesChain({ id: "local", messageId: value })).toThrow(/message.id/i);
+			expect(() => buildThreadingHeaders(value, [])).toThrow(/message.id/i);
+			expect(() => buildThreadingHeaders("m@example.test", [value])).toThrow(/message.id/i);
+		}
+	});
+
+	test("header assembly normalizes brackets and de-duplicates canonical RFC IDs", () => {
+		expect(buildThreadingHeaders("<m-2@example.test>", ["<m-1@example.test>", "m-1@example.test", "<m-2@example.test>"])).toEqual({
+			"In-Reply-To": "<m-2@example.test>",
+			References: "<m-1@example.test> <m-2@example.test>",
+		});
+	});
 	test("a reply carries In-Reply-To and the full References chain", () => {
 		const original = {
 			id: "e-2",
@@ -72,6 +93,17 @@ describe("reply threading", () => {
 });
 
 describe("reply-all recipients", () => {
+	test("Reply-To replaces From before owned-address exclusion and de-duplication", () => {
+		const recipients = computeReplyAll({
+			mailboxAddress: OWNER,
+			originalFrom: "sender@example.test",
+			originalReplyTo: ["help@example.test", OWNER],
+			originalTo: [OWNER, "teammate@example.test"],
+			originalCc: ["help@example.test", "cc@example.test"],
+		});
+		expect(recipients.to).toEqual(["help@example.test", "teammate@example.test"]);
+		expect(recipients.cc).toEqual(["cc@example.test"]);
+	});
 	test("includes the original To and Cc minus the mailbox address", () => {
 		const recipients = computeReplyAll({
 			mailboxAddress: OWNER,

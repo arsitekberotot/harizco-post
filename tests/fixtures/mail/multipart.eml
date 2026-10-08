@@ -1,0 +1,19 @@
+From: Fixture Sender <sender@example.test>
+To: Fixture User <fixture@harizco.test>
+Subject: Harizco fixture multipart
+Message-ID: <fixture-multipart@harizco.test>
+Date: Wed, 07 Oct 2026 12:01:00 +0700
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fixture-mixed"
+
+--fixture-mixed
+Content-Type: text/plain; charset=utf-8
+
+Body text with an attachment.
+--fixture-mixed
+Content-Type: application/octet-stream; name="fixture.bin"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="fixture.bin"
+
+aGFyaXpjby1hdHRhY2htZW50LWJ5dGVz
+--fixture-mixed--
